@@ -59,6 +59,7 @@ class DeviceRuntime:
     supported_flags: int = 0
     last_known_host: int | None = None
     reverse_notifications_observed: bool = False
+    switch_capable: bool = False
     last_error: str | None = None
     updated_at: float = dataclasses.field(default_factory=time.time)
     _lock: threading.RLock = dataclasses.field(default_factory=threading.RLock, repr=False, compare=False)
@@ -85,6 +86,7 @@ class DeviceRuntime:
                 "easy_switch_cids": [f"0x{x:04X}" for x in self.easy_switch_cids],
                 "supported_flags": f"0x{self.supported_flags:02X}",
                 "reverse_notifications_observed": self.reverse_notifications_observed,
+                "switch_capable": self.switch_capable,
                 "last_error": self.last_error,
                 "updated_at": self.updated_at,
             }

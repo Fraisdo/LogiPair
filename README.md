@@ -10,10 +10,13 @@ This is a focused fork/rewrite of [CleverSwitch](https://github.com/MikalaiBarys
 - A `TransportActor` is the only thread allowed to open, read, write, reconnect, or close its HID handles.
 - Native hidapi operations, including enumeration, are additionally serialized process-wide.
 - `PairController` handles one switch transaction at a time and never writes `CHANGE_HOST` back to the source.
+- A valid event remains a memory-only, latest-wins pending intent for up to three seconds while its peer reconnects.
+- `switch_capable` is reached as soon as the live target, slot, and cached/verified `CHANGE_HOST` index are available; `READY` remains stricter.
 - `READY` means critical feature discovery succeeded and all MX Keys Easy-Switch CIDs received reporting ACKs.
 - Bluetooth writes use hidapi 0.15 `hid_send_output_report` (`HidD_SetOutputReport`); receiver writes use `hid_write`.
 - `CHANGE_HOST` is fire-and-forget. LogiPair records the completed write and does not wait for a response from a device that is leaving the host.
 - Power resume, HID arrival/removal, path changes, malformed packets, transport loss, and reporting-flag removal all converge through idempotent recovery.
+- Shutdown waits for every HID owner to close its handles. If an actor cannot stop, LogiPair deliberately skips `hid_exit`.
 
 The recovery backoff is `100 ms, 250 ms, 500 ms, 1 s, 2 s, 5 s, 10 s, 30 s` (capped).
 
@@ -60,7 +63,7 @@ Get-ChildItem "$env:LOCALAPPDATA\LogiPair\logs\logipair.log*" |
   Compress-Archive -DestinationPath "$env:USERPROFILE\Desktop\LogiPair-logs.zip" -Force
 ```
 
-Each switch line includes source, zero-based target, peer, event-to-enqueue latency, event-to-write latency, and write result.
+Each switch line includes source, zero-based target, peer, event-to-enqueue latency, event-to-write latency, and write result. Initialization logs also expose `connected_to_switch_capable_ms` and `connected_to_ready_ms`.
 
 ## Build and test
 
@@ -72,4 +75,4 @@ Requirements: Windows 11, Python 3.10+, PowerShell, and Inno Setup 6.
 
 The script creates an isolated venv, installs pinned build tools, downloads the official hidapi 0.15.0 Windows archive, verifies SHA-256 `D18C43EC9506A2F6D7FAA9C7E0A342C4B64FBAE521B71B5D4AC0777FD24DDA93`, runs lint/tests, builds the one-file EXE, smoke-tests it, and compiles the Inno installer. Outputs are written to `dist\` with `build-manifest.json` hashes.
 
-The automated suite covers source exclusion, reverse routing, duplicate suppression, single-owner I/O, disconnect during switch, failed peer writes and recovery, READY-after-ACK, external flag removal, invalid cache recovery, malformed packets, receiver ownership, and 2,000 serialized switch transactions.
+The automated suite covers source exclusion, latest-wins pending intents and expiry, reverse routing, duplicate suppression, single-owner I/O, shutdown ordering, disconnect during switch, failed peer writes and bounded recovery, cached P0 preemption, READY-after-ACK, external flag removal, invalid cache recovery, malformed packets, receiver ownership, and 2,000 serialized switch transactions.

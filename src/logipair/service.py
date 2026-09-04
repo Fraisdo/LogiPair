@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -34,6 +35,7 @@ class LogiPairService:
         self._paths: dict[str, list[HidPathInfo]] = {}
         self._controller = PairController(self._write_status)
         self._lifecycle = WindowsLifecycleWatcher(self._on_lifecycle)
+        self._backend_shutdown = False
 
     def run(self) -> None:
         self._controller.start()
@@ -48,14 +50,7 @@ class LogiPairService:
         finally:
             self._lifecycle.stop()
             self._lifecycle.join(timeout=3.0)
-            for actor in self._actors.values():
-                actor.stop()
-            for actor in self._actors.values():
-                actor.join(timeout=5.0)
-            self._controller.stop()
-            self._controller.join(timeout=3.0)
-            self._backend.shutdown()
-            log.info("LogiPair service stopped")
+            self._shutdown_components()
 
     def stop(self) -> None:
         self._shutdown.set()
@@ -109,3 +104,31 @@ class LogiPairService:
             self._status.write(health, devices, hidapi_version=self._backend.version)
         except OSError as error:
             log.warning("Could not write status: %s", error)
+
+    def _shutdown_components(self, actor_timeout_seconds: float = 5.0) -> bool:
+        actors = list(self._actors.values())
+        for actor in actors:
+            actor.stop()
+        deadline = time.monotonic() + actor_timeout_seconds
+        for actor in actors:
+            actor.join(timeout=max(0.0, deadline - time.monotonic()))
+        alive = [actor.name for actor in actors if actor.is_alive()]
+        if alive:
+            log.critical(
+                "HID actors did not stop; refusing hid_exit to avoid native race actors=%s",
+                ",".join(alive),
+            )
+            return False
+
+        self._controller.stop()
+        if self._controller.ident is not None:
+            self._controller.join(timeout=3.0)
+        if self._controller.is_alive():
+            log.critical("PairController did not stop; refusing hid_exit")
+            return False
+
+        if not self._backend_shutdown:
+            self._backend.shutdown()
+            self._backend_shutdown = True
+        log.info("LogiPair service stopped")
+        return True

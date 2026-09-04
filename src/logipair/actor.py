@@ -30,6 +30,7 @@ from .constants import (
     REPORT_LONG,
     REPORT_SHORT,
     SW_ID_DIVERT,
+    SW_ID_HOST_CHANGE,
     SW_ID_REQUEST,
 )
 from .controller import PairController
@@ -113,15 +114,18 @@ class TransportActor(threading.Thread):
         self._read_timeout_ms = read_timeout_ms
         self._request_timeout_ms = request_timeout_ms
         self._rearm_throttle_seconds = rearm_throttle_seconds
-        self._queue: queue.PriorityQueue[tuple[int, int, object]] = queue.PriorityQueue()
+        self._queue: queue.PriorityQueue[tuple[int, int, object]] = queue.PriorityQueue(maxsize=256)
         self._sequence = itertools.count()
         self._handles: dict[int, Any] = {}
         self._devices: dict[str, DeviceRuntime] = {}
         self._by_slot: dict[int, str] = {}
-        self._stopping = False
+        self._stop_requested = threading.Event()
+        self._ensure_queued = threading.Event()
         self._retry_index = 0
         self._retry_at = 0.0
         self._last_rearm: dict[str, float] = {}
+        self._connected_at: dict[str, float] = {}
+        self._ready_logged: set[str] = set()
         self._receiver = pid in RECEIVER_PIDS
         self._ignored = False
         if not self._receiver:
@@ -134,21 +138,27 @@ class TransportActor(threading.Thread):
         self._put(0, _Reconcile(self._paths, reason, True))
 
     def ensure_ready(self, reason: str) -> None:
-        self._put(1, _Ensure(reason))
+        if self._ensure_queued.is_set() or self._stop_requested.is_set():
+            return
+        self._ensure_queued.set()
+        if not self._put(1, _Ensure(reason)):
+            self._ensure_queued.clear()
 
     def switch(self, identity: str, target_host: int, observed_at: float) -> Future[SwitchResult]:
         future: Future[SwitchResult] = Future()
-        self._put(0, _Switch(identity, target_host, observed_at, future))
+        if self._stop_requested.is_set() or not self._put(0, _Switch(identity, target_host, observed_at, future)):
+            future.set_result(SwitchResult(False, "actor stopping or queue full", time.monotonic()))
         return future
 
     def stop(self) -> None:
-        self._put(0, _Stop())
+        self._stop_requested.set()
+        self._put(0, _Stop(), allow_stopping=True)
 
     def run(self) -> None:
         try:
-            while not self._stopping:
+            while not self._stop_requested.is_set():
                 self._drain_commands(limit=8)
-                if self._stopping:
+                if self._stop_requested.is_set():
                     break
                 if REPORT_LONG not in self._handles:
                     if self._ignored:
@@ -168,9 +178,17 @@ class TransportActor(threading.Thread):
             self._mark_transport_lost("actor failure")
         finally:
             self._close_handles()
+            self._resolve_queued_switches("actor stopped")
 
-    def _put(self, priority: int, command: object) -> None:
-        self._queue.put((priority, next(self._sequence), command))
+    def _put(self, priority: int, command: object, *, allow_stopping: bool = False) -> bool:
+        if self._stop_requested.is_set() and not allow_stopping:
+            return False
+        try:
+            self._queue.put_nowait((priority, next(self._sequence), command))
+            return True
+        except queue.Full:
+            log.critical("Actor queue full pid=0x%04X command=%s", self.pid, type(command).__name__)
+            return False
 
     def _wait_for_command(self, timeout: float) -> None:
         try:
@@ -189,7 +207,7 @@ class TransportActor(threading.Thread):
 
     def _handle_command(self, command: object) -> None:
         if isinstance(command, _Stop):
-            self._stopping = True
+            self._stop_requested.set()
             return
         if isinstance(command, _Reconcile):
             changed = {path.path for path in command.paths} != {path.path for path in self._paths}
@@ -201,6 +219,7 @@ class TransportActor(threading.Thread):
                 self._retry_at = 0.0
             return
         if isinstance(command, _Ensure):
+            self._ensure_queued.clear()
             log.debug("EnsureReady pid=0x%04X reason=%s", self.pid, command.reason)
             if REPORT_LONG not in self._handles:
                 self._retry_at = 0.0
@@ -210,10 +229,44 @@ class TransportActor(threading.Thread):
                         self._initialize(device)
             return
         if isinstance(command, _Switch):
-            self._perform_switch(command)
+            try:
+                self._perform_switch(command)
+            except Exception as error:
+                if not command.future.done():
+                    command.future.set_result(SwitchResult(False, str(error), time.monotonic()))
+                raise
+
+    def _drain_priority_zero(self, limit: int = 8) -> None:
+        """Run urgent commands while a synchronous discovery request is waiting."""
+        for _ in range(limit):
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                return
+            if item[0] != 0:
+                try:
+                    self._queue.put_nowait(item)
+                except queue.Full:
+                    if isinstance(item[2], _Ensure):
+                        self._ensure_queued.clear()
+                    log.critical("Actor queue filled while restoring deferred command pid=0x%04X", self.pid)
+                return
+            self._handle_command(item[2])
+            if self._stop_requested.is_set():
+                return
+
+    def _resolve_queued_switches(self, detail: str) -> None:
+        while True:
+            try:
+                _, _, command = self._queue.get_nowait()
+            except queue.Empty:
+                return
+            if isinstance(command, _Switch) and not command.future.done():
+                command.future.set_result(SwitchResult(False, detail, time.monotonic()))
 
     def _connect(self) -> None:
         for device in self._devices.values():
+            device.switch_capable = False
             self._transition(device, DeviceState.CONNECTING)
         self._close_handles()
         try:
@@ -230,6 +283,10 @@ class TransportActor(threading.Thread):
             for report_id, path in selected.items():
                 self._handles[report_id] = self._backend.open(path.path)
             self._retry_index = 0
+            connected_at = time.monotonic()
+            for device in self._devices.values():
+                self._connected_at[device.identity] = connected_at
+                self._ready_logged.discard(device.identity)
             log.info("CONNECTED pid=0x%04X transport=%s", self.pid, "receiver" if self._receiver else "Bluetooth")
             if self._receiver:
                 self._backend.write(self._handles[REPORT_SHORT], ENABLE_RECEIVER_NOTIFICATIONS, output_report=False)
@@ -247,6 +304,8 @@ class TransportActor(threading.Thread):
 
     def _poll_handles(self) -> None:
         for report_id in (REPORT_LONG, REPORT_SHORT):
+            if self._stop_requested.is_set():
+                return
             handle = self._handles.get(report_id)
             if handle is None:
                 continue
@@ -268,6 +327,12 @@ class TransportActor(threading.Thread):
         device = self._device_for_slot(report.slot)
         if device is None:
             log.debug("Report for unknown slot=%d pid=0x%04X", report.slot, self.pid)
+            return
+        if isinstance(report, HidError):
+            if report.sw_id == SW_ID_HOST_CHANGE:
+                self._cache.invalidate(device.identity, "CHANGE_HOST protocol error")
+                device.switch_capable = False
+                self._mark_transport_lost(f"CHANGE_HOST HID++ error 0x{report.error_code:02X}")
             return
         if isinstance(report, Notification):
             target = notification_target(report, device)
@@ -302,6 +367,7 @@ class TransportActor(threading.Thread):
         device = self._devices.get(identity)
         if not event.connected:
             if device is not None:
+                device.switch_capable = False
                 self._transition(device, DeviceState.DISCONNECTED, "receiver reports device offline")
             return
         if device is None:
@@ -311,13 +377,21 @@ class TransportActor(threading.Thread):
         else:
             device.slot = event.slot
         self._by_slot[event.slot] = identity
+        self._connected_at[identity] = time.monotonic()
+        self._ready_logged.discard(identity)
         self._initialize(device)
 
     def _initialize(self, device: DeviceRuntime) -> None:
-        if REPORT_LONG not in self._handles or self._stopping:
+        if REPORT_LONG not in self._handles or self._stop_requested.is_set():
             return
-        self._transition(device, DeviceState.INITIALIZING)
         cached = self._cache.get(device.identity, device.wpid)
+        if cached:
+            old = device.state
+            device.transition(DeviceState.INITIALIZING)
+            if old != DeviceState.INITIALIZING:
+                log.debug("State %s %s -> INITIALIZING", device.identity, old.value)
+        else:
+            self._transition(device, DeviceState.INITIALIZING)
         if cached:
             try:
                 device.role = DeviceRole(cached["role"])
@@ -325,11 +399,22 @@ class TransportActor(threading.Thread):
                 device.feature_indexes = {int(k): int(v) for k, v in cached.get("features", {}).items()}
                 device.easy_switch_cids = tuple(int(x) for x in cached.get("easy_switch_cids", []))
                 device.supported_flags = int(cached.get("supported_flags", 0))
-            except (KeyError, TypeError, ValueError):
+            except (AttributeError, KeyError, TypeError, ValueError):
                 self._cache.invalidate(device.identity, "malformed device entry")
                 device.feature_indexes = {}
                 device.easy_switch_cids = ()
                 device.supported_flags = 0
+                cached = None
+        if cached:
+            if self._cached_switch_prerequisites_valid(device):
+                self._controller.register(device, self, publish_status=False)
+                self._set_switch_capable(device, True)
+            else:
+                self._cache.invalidate(device.identity, "invalid cached switch prerequisites")
+                device.feature_indexes = {}
+                device.easy_switch_cids = ()
+                device.supported_flags = 0
+                device.switch_capable = False
                 cached = None
 
         try:
@@ -341,6 +426,7 @@ class TransportActor(threading.Thread):
             if actual_role is None:
                 raise ProtocolError("unsupported Logitech device type")
             if cached and device.role != actual_role:
+                self._set_switch_capable(device, False)
                 self._cache.invalidate(device.identity, "cached device role mismatch")
                 device.easy_switch_cids = ()
                 device.supported_flags = 0
@@ -348,6 +434,7 @@ class TransportActor(threading.Thread):
             device.role = actual_role
             device.name = self._get_name(device, type_name_idx) or device.name
             if not self._is_target_device(device):
+                self._set_switch_capable(device, False)
                 self._transition(device, DeviceState.DISCONNECTED, f"ignored non-target device: {device.name}")
                 if not self._receiver:
                     self._ignored = True
@@ -359,11 +446,13 @@ class TransportActor(threading.Thread):
             if change_host_idx is None:
                 raise ProtocolError("CHANGE_HOST x1814 unavailable")
             if cached and device.feature_indexes.get(FEATURE_CHANGE_HOST) not in (None, change_host_idx):
+                self._set_switch_capable(device, False)
                 self._cache.invalidate(device.identity, "cached CHANGE_HOST index mismatch")
                 device.easy_switch_cids = ()
                 device.supported_flags = 0
                 cached = None
             device.feature_indexes[FEATURE_CHANGE_HOST] = change_host_idx
+            self._set_switch_capable(device, True)
 
             if device.role == DeviceRole.KEYBOARD:
                 reprog_idx = self._resolve_feature(device, FEATURE_REPROG_CONTROLS_V4)
@@ -384,6 +473,8 @@ class TransportActor(threading.Thread):
             self._cache.save(device)
             log.info("READY role=%s name=%s identity=%s", device.role.value, device.name, device.identity)
         except (ProtocolError, TransportError, ValueError) as error:
+            if self._stop_requested.is_set():
+                return
             self._transition(device, DeviceState.RECOVERING, str(error))
             delay = BACKOFF_SECONDS[min(self._retry_index, len(BACKOFF_SECONDS) - 1)]
             self._retry_index += 1
@@ -411,6 +502,7 @@ class TransportActor(threading.Thread):
         length = response[0]
         value = bytearray()
         while len(value) < length:
+            self._raise_if_stopping()
             response = self._request(device, feature_index, 0x10, bytes((len(value),)))
             if not response:
                 break
@@ -424,6 +516,7 @@ class TransportActor(threading.Thread):
         found: list[int] = []
         supported = 0
         for index in range(response[0]):
+            self._raise_if_stopping()
             info = self._request(device, feature_index, 0x10, bytes((index,)))
             if not info or len(info) < 5:
                 continue
@@ -451,12 +544,15 @@ class TransportActor(threading.Thread):
             return
         try:
             for cid in device.easy_switch_cids:
+                self._raise_if_stopping()
                 message = build_cid_reporting(device.slot, feature_index, cid, device.supported_flags)
                 response = self._request_raw(device, message, feature_index, 0x30, SW_ID_DIVERT)
                 if response is None:
                     raise ProtocolError(f"no ACK arming CID 0x{cid:04X}")
             self._transition(device, DeviceState.READY)
         except (ProtocolError, TransportError) as error:
+            if self._stop_requested.is_set():
+                return
             self._transition(device, DeviceState.RECOVERING, str(error))
             delay = BACKOFF_SECONDS[min(self._retry_index, len(BACKOFF_SECONDS) - 1)]
             self._retry_index += 1
@@ -480,12 +576,19 @@ class TransportActor(threading.Thread):
         function: int,
         sw_id: int,
     ) -> bytes | None:
+        self._raise_if_stopping()
+        self._drain_priority_zero()
+        self._raise_if_stopping()
         handle = self._handles.get(REPORT_LONG)
         if handle is None:
             raise TransportError("long transport unavailable")
         self._backend.write(handle, message, output_report=not self._receiver)
         deadline = time.monotonic() + self._request_timeout_ms / 1000
-        while time.monotonic() < deadline:
+        while not self._stop_requested.is_set() and time.monotonic() < deadline:
+            self._drain_priority_zero()
+            self._raise_if_stopping()
+            if self._handles.get(REPORT_LONG) is not handle:
+                raise TransportError("transport changed during request")
             raw = self._backend.read(handle, min(self._read_timeout_ms, 25))
             if not raw:
                 continue
@@ -495,12 +598,16 @@ class TransportActor(threading.Thread):
                     raise ProtocolError(f"HID++ error 0x{report.error_code:02X}")
                 return report.payload if isinstance(report, Response) else None
             self._dispatch(report, raw)
+        self._raise_if_stopping()
         return None
 
     def _perform_switch(self, command: _Switch) -> None:
+        if self._stop_requested.is_set():
+            command.future.set_result(SwitchResult(False, "actor stopping", time.monotonic()))
+            return
         device = self._devices.get(command.identity)
-        if device is None or device.state != DeviceState.READY:
-            command.future.set_result(SwitchResult(False, "peer not READY", time.monotonic()))
+        if device is None or not device.switch_capable or REPORT_LONG not in self._handles:
+            command.future.set_result(SwitchResult(False, "peer not switch-capable", time.monotonic()))
             return
         feature_index = device.feature_indexes.get(FEATURE_CHANGE_HOST)
         if feature_index is None:
@@ -508,8 +615,9 @@ class TransportActor(threading.Thread):
             return
         # Do not run status persistence before the P0 write. The controller records the
         # post-write state after the future completes, keeping disk I/O off the hot path.
+        previous_state = device.state
         device.transition(DeviceState.SWITCHING)
-        log.debug("State %s READY -> SWITCHING", device.identity)
+        log.debug("State %s %s -> SWITCHING", device.identity, previous_state.value)
         try:
             handle = self._handles[REPORT_LONG]
             message = build_change_host(device.slot, feature_index, command.target_host)
@@ -517,10 +625,12 @@ class TransportActor(threading.Thread):
             wrote_at = time.monotonic()
             device.last_known_host = command.target_host + 1
             # CHANGE_HOST is fire-and-forget. A reply cannot be required after the peer leaves this host.
-            device.transition(DeviceState.READY)
+            device.transition(previous_state)
             command.future.set_result(SwitchResult(True, "write completed", wrote_at))
         except (KeyError, TransportError, ValueError) as error:
             wrote_at = time.monotonic()
+            device.switch_capable = False
+            self._cache.invalidate(device.identity, "CHANGE_HOST write failed")
             self._transition(device, DeviceState.RECOVERING, str(error))
             command.future.set_result(SwitchResult(False, str(error), wrote_at))
             self._mark_transport_lost(str(error))
@@ -528,7 +638,10 @@ class TransportActor(threading.Thread):
     def _mark_transport_lost(self, reason: str) -> None:
         self._close_handles()
         for device in self._devices.values():
+            device.switch_capable = False
             self._transition(device, DeviceState.RECOVERING, reason)
+        if self._stop_requested.is_set():
+            return
         delay = BACKOFF_SECONDS[min(self._retry_index, len(BACKOFF_SECONDS) - 1)]
         self._retry_index += 1
         self._retry_at = time.monotonic() + delay
@@ -547,12 +660,44 @@ class TransportActor(threading.Thread):
         device.transition(state, error)
         if old != state:
             log.debug("State %s %s -> %s", device.identity, old.value, state.value)
+            if (
+                state == DeviceState.READY
+                and device.identity in self._connected_at
+                and device.identity not in self._ready_logged
+            ):
+                elapsed_ms = (time.monotonic() - self._connected_at[device.identity]) * 1000
+                log.info("connected_to_ready_ms=%.2f identity=%s", elapsed_ms, device.identity)
+                self._ready_logged.add(device.identity)
         self._controller.state_changed(device)
+
+    def _set_switch_capable(self, device: DeviceRuntime, capable: bool) -> None:
+        changed = device.switch_capable != capable
+        device.switch_capable = capable
+        if capable and changed:
+            started = self._connected_at.get(device.identity)
+            elapsed_ms = (time.monotonic() - started) * 1000 if started is not None else 0.0
+            log.info("connected_to_switch_capable_ms=%.2f identity=%s", elapsed_ms, device.identity)
+        if changed:
+            self._controller.capability_changed(device)
+
+    @staticmethod
+    def _cached_switch_prerequisites_valid(device: DeviceRuntime) -> bool:
+        feature_index = device.feature_indexes.get(FEATURE_CHANGE_HOST)
+        return (
+            device.role in (DeviceRole.KEYBOARD, DeviceRole.MOUSE)
+            and TransportActor._is_target_device(device)
+            and isinstance(feature_index, int)
+            and 0 < feature_index <= 0xFF
+        )
+
+    def _raise_if_stopping(self) -> None:
+        if self._stop_requested.is_set():
+            raise TransportError("actor stopping")
 
     def _device_for_slot(self, slot: int) -> DeviceRuntime | None:
         if not self._receiver:
             return next(iter(self._devices.values()), None)
-        identity = self._by_slot.get(slot)
+        identity = self._by_slot.get(slot) or self._by_slot.get(slot ^ 0xFF)
         return self._devices.get(identity) if identity else None
 
     def _ensure_direct_runtime(self) -> DeviceRuntime:

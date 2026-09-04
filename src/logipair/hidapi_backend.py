@@ -70,6 +70,7 @@ class HidApiBackend:
         self._bind()
         if self._lib.hid_init() != 0:
             raise TransportError("hid_init failed")
+        self._shutdown = False
         raw_version = self._lib.hid_version_str()
         self.version = raw_version.decode("ascii", errors="replace") if raw_version else "unknown"
         if _version_tuple(self.version) < (0, 15, 0):
@@ -140,6 +141,7 @@ class HidApiBackend:
 
     def enumerate(self) -> list[HidPathInfo]:
         with self._native_lock:
+            self._assert_running()
             head = self._lib.hid_enumerate(LOGITECH_VENDOR_ID, 0)
             entries: list[HidPathInfo] = []
             seen: set[bytes] = set()
@@ -172,6 +174,7 @@ class HidApiBackend:
     def open(self, path: bytes) -> OwnedHandle:
         owner = threading.get_ident()
         with self._native_lock:
+            self._assert_running()
             pointer = self._lib.hid_open_path(path)
             if not pointer:
                 raise TransportError(f"hid_open_path failed: {self._error(None)}")
@@ -180,6 +183,7 @@ class HidApiBackend:
     def read(self, handle: OwnedHandle, timeout_ms: int = 0) -> bytes | None:
         self._assert_owner(handle)
         with self._native_lock:
+            self._assert_running()
             self._assert_open(handle)
             buf = (ctypes.c_ubyte * MAX_READ_SIZE)()
             count = self._lib.hid_read_timeout(handle.pointer, buf, MAX_READ_SIZE, timeout_ms)
@@ -190,6 +194,7 @@ class HidApiBackend:
     def write(self, handle: OwnedHandle, message: bytes, *, output_report: bool) -> None:
         self._assert_owner(handle)
         with self._native_lock:
+            self._assert_running()
             self._assert_open(handle)
             buf = (ctypes.c_ubyte * len(message))(*message)
             function = self._lib.hid_send_output_report if output_report else self._lib.hid_write
@@ -201,13 +206,16 @@ class HidApiBackend:
     def close(self, handle: OwnedHandle) -> None:
         self._assert_owner(handle)
         with self._native_lock:
+            self._assert_running()
             if handle.pointer is not None:
                 self._lib.hid_close(handle.pointer)
                 handle.pointer = None
 
     def shutdown(self) -> None:
         with self._native_lock:
-            self._lib.hid_exit()
+            if not self._shutdown:
+                self._lib.hid_exit()
+                self._shutdown = True
 
     def _assert_owner(self, handle: OwnedHandle) -> None:
         current = threading.get_ident()
@@ -220,6 +228,10 @@ class HidApiBackend:
     def _assert_open(handle: OwnedHandle) -> None:
         if handle.pointer is None:
             raise TransportError("operation on closed HID handle")
+
+    def _assert_running(self) -> None:
+        if self._shutdown:
+            raise TransportError("hidapi is shut down")
 
     def _error(self, pointer: int | None) -> str:
         value = self._lib.hid_error(pointer)

@@ -11,6 +11,7 @@ from logipair.constants import FEATURE_CHANGE_HOST, FEATURE_REPROG_CONTROLS_V4, 
 from logipair.controller import PairController
 from logipair.errors import TransportError
 from logipair.model import DeviceRole, DeviceRuntime, DeviceState, HidPathInfo, HostChange, PairHealth
+from logipair.service import LogiPairService
 from logipair.storage import DeviceCache
 
 
@@ -78,11 +79,24 @@ def test_peer_write_failure_recovers_without_crash(fake_backend, tmp_path):
     controller, keyboard, mouse = start_pair(fake_backend, tmp_path)
     fake_backend.fail_change_for.add(b"mouse")
     fake_backend.inject(b"kb", notification(2, b"\x00\x01"))
-    wait_until(lambda: len(fake_backend.change_writes(b"mouse")) == 1)
+    wait_until(lambda: len(fake_backend.change_writes(b"mouse")) >= 1)
+    wait_until(lambda: len([item for item in fake_backend.opens if item[0] == b"mouse"]) >= 2)
+    wait_until(lambda: len(fake_backend.change_writes(b"mouse")) == 2)
     wait_until(lambda: controller.health == PairHealth.PAIR_READY)
     stop_pair(controller, keyboard, mouse)
     assert fake_backend.violations == []
     assert len([item for item in fake_backend.opens if item[0] == b"mouse"]) >= 2
+    assert len(fake_backend.change_writes(b"mouse")) == 2
+
+
+def test_change_host_protocol_error_invalidates_and_recovers(fake_backend, tmp_path):
+    controller, keyboard, mouse = start_pair(fake_backend, tmp_path)
+    error = bytes((0x11, 0xFF, 0xFF, 0x0F, 0, 2)) + bytes(14)
+    fake_backend.inject(b"mouse", error)
+    wait_until(lambda: len([item for item in fake_backend.opens if item[0] == b"mouse"]) >= 2)
+    wait_until(lambda: controller.health == PairHealth.PAIR_READY)
+    stop_pair(controller, keyboard, mouse)
+    assert fake_backend.violations == []
 
 
 def test_device_never_ready_before_all_arm_acks(fake_backend, tmp_path):
@@ -196,6 +210,131 @@ def test_mx_keys_mini_is_not_selected_for_this_personal_pair():
     keys = DeviceRuntime("keys", 2, 2, 0xFF, "Bluetooth", DeviceRole.KEYBOARD, "MX Keys")
     assert not TransportActor._is_target_device(mini)
     assert TransportActor._is_target_device(keys)
+
+
+def test_cached_peer_switches_during_noncritical_initialization(fake_backend, tmp_path):
+    kb_path = fake_backend.add(b"kb", name="MX Keys Wireless Keyboard", device_type=0)
+    mouse_path = fake_backend.add(b"mouse", name="MX Anywhere 3S", device_type=3)
+    mouse_identity = f"bluetooth:{mouse_path.pid:04x}:mouse"
+    cache_path = tmp_path / "cache.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "devices": {
+                    mouse_identity: {
+                        "wpid": mouse_path.pid,
+                        "role": "mouse",
+                        "name": "MX Anywhere 3S",
+                        "features": {str(FEATURE_CHANGE_HOST): 2},
+                        "easy_switch_cids": [],
+                        "supported_flags": 0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    controller = PairController(lambda *_: None, debounce_seconds=0)
+    cache = DeviceCache(cache_path)
+    keyboard = TransportActor(
+        kb_path.pid, [kb_path], fake_backend, controller, cache, read_timeout_ms=1, request_timeout_ms=80
+    )
+    mouse = TransportActor(
+        mouse_path.pid, [mouse_path], fake_backend, controller, cache, read_timeout_ms=1, request_timeout_ms=400
+    )
+    controller.start()
+    keyboard.start()
+    wait_until(
+        lambda: any(
+            device.role == DeviceRole.KEYBOARD and device.state == DeviceState.READY
+            for device in controller.devices()
+        )
+    )
+    fake_backend.withhold_responses_for.add((b"mouse", 0, 0))
+    mouse.start()
+    wait_until(
+        lambda: any(
+            device.identity == mouse_identity
+            and device.switch_capable
+            and device.state == DeviceState.INITIALIZING
+            for device in controller.devices()
+        )
+    )
+    source = next(device for device in controller.devices() if device.role == DeviceRole.KEYBOARD)
+    started = time.monotonic()
+    controller.submit(HostChange(source.identity, source.role, 2, started))
+    wait_until(lambda: len(fake_backend.change_writes(b"mouse")) == 1, timeout=0.2)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.2
+    assert fake_backend.change_writes(b"kb") == []
+    stop_pair(controller, keyboard, mouse)
+
+
+def test_service_waits_for_slow_actor_close_before_hid_exit(fake_backend, tmp_path):
+    path = fake_backend.add(b"mouse", name="MX Anywhere 3S", device_type=3)
+    service = LogiPairService(tmp_path / "cache.json", tmp_path / "status.json", backend=fake_backend)
+    actor = TransportActor(
+        path.pid,
+        [path],
+        fake_backend,
+        service._controller,
+        service._cache,
+        read_timeout_ms=1,
+        request_timeout_ms=80,
+    )
+    service._actors["mouse"] = actor
+    service._controller.start()
+    actor.start()
+    wait_until(
+        lambda: service._controller.devices()
+        and service._controller.devices()[0].state == DeviceState.READY
+    )
+    fake_backend.withhold_responses_for.add((b"mouse", 0, 0))
+    fake_backend.slow_read_seconds[b"mouse"] = 0.12
+    actor.recover("exercise shutdown during request")
+    wait_until(fake_backend.slow_read_started.is_set)
+    assert service._shutdown_components(actor_timeout_seconds=1)
+    assert not actor.is_alive()
+    assert fake_backend.shutdown_count == 1
+    assert fake_backend.native_events[-1][0] == "shutdown"
+    assert any(event[0] == "close" for event in fake_backend.native_events[:-1])
+    assert {owner for _, owner in fake_backend.closes} == {owner for _, owner in fake_backend.opens}
+    assert fake_backend.violations == []
+    assert service._shutdown_components(actor_timeout_seconds=1)
+    assert fake_backend.shutdown_count == 1
+
+
+def test_queued_and_new_switch_futures_resolve_during_stop(fake_backend, tmp_path):
+    path = fake_backend.add(b"mouse", name="MX Anywhere 3S", device_type=3)
+    controller = PairController(lambda *_: None)
+    actor = TransportActor(path.pid, [path], fake_backend, controller, DeviceCache(tmp_path / "cache.json"))
+    queued = actor.switch("missing", 1, time.monotonic())
+    actor.stop()
+    rejected = actor.switch("missing", 1, time.monotonic())
+    actor.start()
+    actor.join(timeout=1)
+    assert queued.result(timeout=0.1).detail == "actor stopped"
+    assert rejected.result(timeout=0.1).detail == "actor stopping or queue full"
+
+
+def test_service_refuses_hid_exit_while_actor_is_alive(fake_backend, tmp_path):
+    class StuckActor:
+        name = "stuck-actor"
+
+        def stop(self):
+            pass
+
+        def join(self, timeout):
+            pass
+
+        def is_alive(self):
+            return True
+
+    service = LogiPairService(tmp_path / "cache.json", tmp_path / "status.json", backend=fake_backend)
+    service._actors["stuck"] = StuckActor()
+    assert not service._shutdown_components(actor_timeout_seconds=0.01)
+    assert fake_backend.shutdown_count == 0
 
 
 @pytest.mark.no_cover

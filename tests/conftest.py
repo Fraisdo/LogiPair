@@ -39,6 +39,13 @@ class FakeBackend:
         self.violations: list[str] = []
         self.fail_change_for: set[bytes] = set()
         self.withhold_arm_ack: set[bytes] = set()
+        self.withhold_responses_for: set[tuple[bytes, int, int]] = set()
+        self.slow_read_seconds: dict[bytes, float] = {}
+        self._slow_read_armed: set[bytes] = set()
+        self.slow_read_started = threading.Event()
+        self.native_events: list[tuple[str, bytes | None, int]] = []
+        self.shutdown_count = 0
+        self.shutdown_called = False
         self._lock = threading.Lock()
 
     def add(self, path: bytes, *, name: str, device_type: int) -> HidPathInfo:
@@ -61,6 +68,11 @@ class FakeBackend:
 
     def read(self, handle: FakeHandle, timeout_ms: int = 0) -> bytes | None:
         self._check(handle, "read")
+        delay = self.slow_read_seconds.pop(handle.path, 0) if handle.path in self._slow_read_armed else 0
+        if delay:
+            self._slow_read_armed.discard(handle.path)
+            self.slow_read_started.set()
+            time.sleep(delay)
         try:
             if timeout_ms <= 1:
                 item = self.queues[handle.path].get_nowait()
@@ -87,6 +99,10 @@ class FakeBackend:
             return
         if feature == 3 and function == 0x30 and handle.path in self.withhold_arm_ack:
             return
+        if (handle.path, feature, function) in self.withhold_responses_for:
+            if handle.path in self.slow_read_seconds:
+                self._slow_read_armed.add(handle.path)
+            return
         payload = self._response_payload(handle.path, message)
         response = bytes([REPORT_LONG, message[1], feature, function | sw_id]) + payload.ljust(16, b"\0")
         self.queues[handle.path].put(response)
@@ -95,9 +111,12 @@ class FakeBackend:
         self._check(handle, "close")
         handle.closed = True
         self.closes.append((handle.path, threading.get_ident()))
+        self.native_events.append(("close", handle.path, threading.get_ident()))
 
     def shutdown(self) -> None:
-        pass
+        self.shutdown_count += 1
+        self.shutdown_called = True
+        self.native_events.append(("shutdown", None, threading.get_ident()))
 
     def inject(self, path: bytes, report: bytes | Exception) -> None:
         self.queues[path].put(report)
@@ -116,6 +135,9 @@ class FakeBackend:
         return [item for item in self.writes if item[0] == path and item[1][2] == 3 and (item[1][3] & 0xF0) == 0x30]
 
     def _check(self, handle: FakeHandle, operation: str) -> None:
+        if self.shutdown_called:
+            self.violations.append(f"{operation} after shutdown")
+            raise TransportError(self.violations[-1])
         if handle.owner != threading.get_ident():
             self.violations.append(f"{operation} from non-owner")
             raise TransportError(self.violations[-1])
