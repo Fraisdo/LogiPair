@@ -50,6 +50,9 @@ class FakeBackend:
         self._slow_read_armed: set[bytes] = set()
         self.slow_read_started = threading.Event()
         self.native_events: list[tuple[str, bytes | None, int]] = []
+        # Ordered record of every read that returned data and every write, so tests can
+        # prove what happened before what on the wire.
+        self.timeline: list[tuple[str, bytes, bytes]] = []
         self.shutdown_count = 0
         self.shutdown_called = False
         self._lock = threading.Lock()
@@ -93,6 +96,8 @@ class FakeBackend:
             return None
         if isinstance(item, Exception):
             raise item
+        with self._lock:
+            self.timeline.append(("read", handle.path, item))
         return item
 
     def write(self, handle: FakeHandle, message: bytes, *, output_report: bool) -> None:
@@ -103,6 +108,7 @@ class FakeBackend:
             raise TransportError("hid_send_output_report failed: HidD_SetOutputReport")
         with self._lock:
             self.writes.append((handle.path, bytes(message), output_report, threading.get_ident()))
+            self.timeline.append(("write", handle.path, bytes(message)))
         if message[0] != REPORT_LONG:
             return
         feature, function, sw_id = message[2], message[3] & 0xF0, message[3] & 0x0F

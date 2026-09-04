@@ -1107,3 +1107,122 @@ def test_writes_failing_just_after_a_provisional_connect_stay_quiet(fake_backend
     assert keyboard._retry_index == 0
     assert warnings == []
     assert any("Discovery deferred; Windows still settling" in item for item in messages(caplog))
+
+
+# --------------------------------------------------------------------------
+# RC3 - a press consumed BY the read probe must still reach the peer
+# --------------------------------------------------------------------------
+
+
+def test_easy_switch_consumed_by_the_read_probe_reaches_the_peer_before_discovery(
+    fake_backend, tmp_path, caplog
+):
+    """The press is read by _validate_transport itself, not by the poll loop.
+
+    Host A READY -> A->B -> both devices leave -> the keyboard returns with the user's
+    B->A notification already waiting on the wire, so the validation probe consumes it
+    before observer_capable is published and before _initialize does anything. That
+    report must reach PairController and move the mouse, not sit behind P1 discovery.
+    """
+    controller, keyboard, mouse, kb_path, mouse_path = start_pair(fake_backend, tmp_path, debounce=0)
+
+    with caplog.at_level(logging.DEBUG, logger="logipair.actor"):
+        try:
+            # --- A -> B -------------------------------------------------------
+            fake_backend.inject(b"kb", notification(2, b"\x00\x01"))
+            wait_until(lambda: len(fake_backend.change_writes(b"mouse")) == 1)
+            kb_runtime = next(item for item in controller.devices() if item.role == DeviceRole.KEYBOARD)
+            mouse_runtime = next(item for item in controller.devices() if item.role == DeviceRole.MOUSE)
+
+            # --- both devices really leave this host --------------------------
+            fake_backend.specs.pop(b"kb")
+            fake_backend.specs.pop(b"mouse")
+            keyboard.update_paths([], "device-removal")
+            mouse.update_paths([], "device-removal")
+            wait_until(lambda: kb_runtime.state == DeviceState.EXPECTED_DISCONNECTED)
+            wait_until(lambda: mouse_runtime.state == DeviceState.EXPECTED_DISCONNECTED)
+
+            # The mouse is back first, so the peer is writable when the press lands.
+            fake_backend.add(b"mouse", name="MX Anywhere 3S", device_type=3)
+            mouse.update_paths([mouse_path], "device-arrival")
+            mouse.device_arrived("device-arrival")
+            wait_until(lambda: mouse_runtime.switch_capable, timeout=3)
+
+            # --- the user's B->A press is already queued when the path returns --
+            fake_backend.add(b"kb", name="MX Keys Wireless Keyboard", device_type=0)
+            fake_backend.inject(b"kb", notification(2, b"\x00\x00"))
+            mark = len(fake_backend.timeline)
+            keyboard.update_paths([kb_path], "device-arrival")
+            keyboard.device_arrived("device-arrival")
+
+            wait_until(lambda: len(fake_backend.change_writes(b"mouse")) == 2, timeout=5)
+            timeline = fake_backend.timeline[mark:]
+            emitted = messages(caplog)
+            warnings = [
+                record.getMessage()
+                for record in caplog.records
+                if record.levelno >= logging.WARNING and record.name == "logipair.actor"
+            ]
+        finally:
+            stop_pair(controller, keyboard, mouse)
+
+    # The invariant, proven on the wire: the probe consumed the press, and NO keyboard
+    # discovery write got between that read and the peer's CHANGE_HOST. Before the fix
+    # the whole of P1 discovery ran in that gap while the press sat in a buffer.
+    read_at = next(
+        index
+        for index, (kind, path, payload) in enumerate(timeline)
+        if kind == "read" and path == b"kb" and payload[2] == 2 and payload[4:6] == b"\x00\x00"
+    )
+    peer_write_at = next(
+        index
+        for index, (kind, path, payload) in enumerate(timeline)
+        if kind == "write" and path == b"mouse" and payload[2] == 2 and (payload[3] & 0xF0) == 0x10
+    )
+    assert read_at < peer_write_at
+    blocking = [entry for entry in timeline[read_at:peer_write_at] if entry[0] == "write" and entry[1] == b"kb"]
+    assert blocking == [], f"{len(blocking)} keyboard discovery writes delayed the peer switch"
+
+    # The probe - not the poll loop - is what read it.
+    assert any("Read probe consumed 1 report(s)" in item for item in emitted)
+
+    # It was dispatched exactly once, and it moved the peer the right way.
+    assert len([item for item in emitted if "EasySwitch source=" in item and "target=0" in item]) == 1
+    assert [item[1][4] for item in fake_backend.change_writes(b"mouse")] == [1, 0]
+    assert fake_backend.change_writes(b"kb") == []  # source exclusion holds
+
+    # The departure the press implies is marked, and costs nothing.
+    assert kb_runtime.away_expected
+    assert kb_runtime.departure_grace_until > 0
+    assert keyboard._retry_index == 0 and mouse._retry_index == 0
+    assert warnings == []
+    assert fake_backend.violations == []
+
+
+def test_a_cold_connect_does_not_discard_reports_read_by_the_probe(fake_backend, tmp_path):
+    """With no cache the press cannot be interpreted at probe time, so it is dispatched
+    once discovery has filled the feature indexes in - never dropped."""
+    kb_path = fake_backend.add(b"kb", name="MX Keys Wireless Keyboard", device_type=0)
+    mouse_path = fake_backend.add(b"mouse", name="MX Anywhere 3S", device_type=3)
+    controller = PairController(lambda *_: None, debounce_seconds=0)
+    cache = DeviceCache(tmp_path / "cache.json")  # empty: nothing has ever been seen
+    mouse = TransportActor(
+        mouse_path.pid, [mouse_path], fake_backend, controller, cache, read_timeout_ms=1, request_timeout_ms=80
+    )
+    keyboard = TransportActor(
+        kb_path.pid, [kb_path], fake_backend, controller, cache, read_timeout_ms=1, request_timeout_ms=80
+    )
+    controller.start()
+    mouse.start()
+    wait_until(lambda: any(item.role == DeviceRole.MOUSE and item.switch_capable for item in controller.devices()))
+
+    # Already on the wire when the probe runs, before anything is known about this device.
+    fake_backend.inject(b"kb", notification(2, b"\x00\x02"))
+    try:
+        keyboard.start()
+        wait_until(lambda: len(fake_backend.change_writes(b"mouse")) == 1, timeout=5)
+    finally:
+        stop_pair(controller, keyboard, mouse)
+
+    assert fake_backend.change_writes(b"mouse")[0][1][4] == 2
+    assert fake_backend.change_writes(b"kb") == []

@@ -61,6 +61,10 @@ from .storage import DeviceCache
 
 log = logging.getLogger(__name__)
 
+# Sentinel: _initialize should load the cache itself instead of reusing a restore that
+# _connect already performed before dispatching the read probe's reports.
+_RESTORE_FROM_CACHE = object()
+
 
 class Backend(Protocol):
     def open(self, path: bytes) -> Any: ...
@@ -423,12 +427,23 @@ class TransportActor(threading.Thread):
                 provisional_ms,
             )
             if self._receiver:
+                self._dispatch_buffered(buffered)
                 self._backend.write(self._handles[REPORT_SHORT], ENABLE_RECEIVER_NOTIFICATIONS, output_report=False)
                 self._backend.write(self._handles[REPORT_SHORT], ENUMERATE_RECEIVER_DEVICES, output_report=False)
             else:
-                self._initialize(self._ensure_direct_runtime())
-            for raw in buffered:
-                self._dispatch(parse_report(raw), raw)
+                runtime = self._ensure_direct_runtime()
+                # P0 ordering. Restore the cached identity first - no HID traffic - so a
+                # press the probe swallowed is understood, hand it over, and only then
+                # start discovery. If that press marked a departure, _initialize defers
+                # and the device is left alone on its way out.
+                restored = self._restore_cached_runtime(runtime)
+                if restored:
+                    self._dispatch_buffered(buffered)
+                    buffered = []
+                self._initialize(runtime, restored)
+                # Cold connect: nothing could interpret these until discovery filled the
+                # feature indexes in, so they are dispatched now rather than discarded.
+                self._dispatch_buffered(buffered)
         except Exception as error:
             self._close_handles()
             delay, quiet = self._schedule_retry()
@@ -548,7 +563,61 @@ class TransportActor(threading.Thread):
         self._ready_logged.discard(identity)
         self._initialize(device)
 
-    def _initialize(self, device: DeviceRuntime) -> None:
+    def _restore_cached_runtime(self, device: DeviceRuntime) -> dict[str, Any] | None:
+        """Put the cached identity back on the runtime without touching the transport.
+
+        Deliberately free of HID traffic. It runs before the read probe's reports are
+        dispatched, so an Easy-Switch press the probe swallowed can be understood and
+        handed to PairController before discovery starts talking to the device.
+        """
+        cached = self._cache.get(device.identity, device.wpid)
+        if cached:
+            old = device.state
+            device.transition(DeviceState.INITIALIZING)
+            if old != DeviceState.INITIALIZING:
+                log.debug("State %s %s -> INITIALIZING", device.identity, old.value)
+        else:
+            self._transition(device, DeviceState.INITIALIZING)
+            return None
+        try:
+            device.role = DeviceRole(cached["role"])
+            device.name = cached.get("name")
+            device.feature_indexes = {int(k): int(v) for k, v in cached.get("features", {}).items()}
+            device.easy_switch_cids = tuple(int(x) for x in cached.get("easy_switch_cids", []))
+            device.supported_flags = int(cached.get("supported_flags", 0))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            self._cache.invalidate(device.identity, "malformed device entry")
+            device.feature_indexes = {}
+            device.easy_switch_cids = ()
+            device.supported_flags = 0
+            return None
+        if not self._cached_switch_prerequisites_valid(device):
+            self._cache.invalidate(device.identity, "invalid cached switch prerequisites")
+            device.feature_indexes = {}
+            device.easy_switch_cids = ()
+            device.supported_flags = 0
+            device.switch_capable = False
+            return None
+        # Registered and switch-capable before any discovery: a host-change intent seen
+        # from here on can already reach PairController and the peer.
+        self._controller.register(device, self, publish_status=False)
+        self._set_switch_capable(device, True)
+        return cached
+
+    def _dispatch_buffered(self, reports: list[bytes]) -> None:
+        """Deliver reports the read probe consumed, ahead of any discovery traffic.
+
+        The probe can swallow the very Easy-Switch press the user just made. Holding it
+        behind P1 discovery would reproduce the exact miss this design exists to
+        prevent, so the peer write has to win that race.
+        """
+        if not reports:
+            return
+        log.debug("Read probe consumed %d report(s) pid=0x%04X; dispatching", len(reports), self.pid)
+        for raw in reports:
+            self._dispatch(parse_report(raw), raw)
+
+    def _initialize(self, device: DeviceRuntime, cached: Any = _RESTORE_FROM_CACHE) -> None:
         if REPORT_LONG not in self._handles or self._stop_requested.is_set():
             return
         if self._in_departure_grace(device):
@@ -559,42 +628,12 @@ class TransportActor(threading.Thread):
                 self._transition(device, DeviceState.EXPECTED_DISCONNECTED)
                 self._schedule_retry()
             return
-        cached = self._cache.get(device.identity, device.wpid)
+        if cached is _RESTORE_FROM_CACHE:
+            cached = self._restore_cached_runtime(device)
         if cached:
-            old = device.state
-            device.transition(DeviceState.INITIALIZING)
-            if old != DeviceState.INITIALIZING:
-                log.debug("State %s %s -> INITIALIZING", device.identity, old.value)
-        else:
-            self._transition(device, DeviceState.INITIALIZING)
-        if cached:
-            try:
-                device.role = DeviceRole(cached["role"])
-                device.name = cached.get("name")
-                device.feature_indexes = {int(k): int(v) for k, v in cached.get("features", {}).items()}
-                device.easy_switch_cids = tuple(int(x) for x in cached.get("easy_switch_cids", []))
-                device.supported_flags = int(cached.get("supported_flags", 0))
-            except (AttributeError, KeyError, TypeError, ValueError):
-                self._cache.invalidate(device.identity, "malformed device entry")
-                device.feature_indexes = {}
-                device.easy_switch_cids = ()
-                device.supported_flags = 0
-                cached = None
-        if cached:
-            if self._cached_switch_prerequisites_valid(device):
-                self._controller.register(device, self, publish_status=False)
-                # Hot path first: with the cache we can already write CHANGE_HOST, and
-                # arming makes the read path genuinely live. Cosmetic discovery below
-                # must delay neither.
-                self._set_switch_capable(device, True)
-                self._establish_cached_observer(device)
-            else:
-                self._cache.invalidate(device.identity, "invalid cached switch prerequisites")
-                device.feature_indexes = {}
-                device.easy_switch_cids = ()
-                device.supported_flags = 0
-                device.switch_capable = False
-                cached = None
+            # Arming makes the read path genuinely live; the cosmetic discovery below
+            # must not delay it.
+            self._establish_cached_observer(device)
 
         try:
             type_name_idx = self._resolve_feature(device, FEATURE_DEVICE_TYPE_AND_NAME)
