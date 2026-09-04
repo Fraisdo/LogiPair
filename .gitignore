@@ -125,6 +125,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+work/
 env/
 venv/
 ENV/
@@ -163,4 +164,3 @@ cython_debug/
 #.idea/
 
 hidpp20 public/
-

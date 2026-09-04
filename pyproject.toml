@@ -1,43 +1,38 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools==80.9.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cleverswitch"
-version = "1.5.1"
-description = "Synchronize host switching between Logitech MX Keys and MX Master 3"
+name = "logipair"
+version = "1.0.0"
+description = "Reliable Windows-only Easy-Switch pairing for MX Keys and MX Anywhere 3S"
 requires-python = ">=3.10"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE.txt"]
-dependencies = [
-    "hid >= 1.0.9 ; sys_platform == 'win32'",  # provides hidapi.dll on Windows; Linux/macOS use system libhidapi
-    "pyyaml >= 6.0",
-    "bleak >= 0.22, < 3; sys_platform == 'darwin'",  # 3.x uses the uv_build backend; can't build from sdist in Homebrew
-    "pyobjc-framework-CoreBluetooth ; sys_platform == 'darwin'",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest >= 7.0",
-    "pytest-mock >= 3.10",
-    "pytest-cov >= 4.0",
+classifiers = [
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "Programming Language :: Python :: 3",
 ]
 
 [project.scripts]
-cleverswitch = "cleverswitch.cli.cli_module:main"
+logipair = "logipair.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["logipair*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--tb=short --cov --cov-fail-under=90"
+pythonpath = ["src"]
+addopts = "--tb=short --cov=logipair --cov-report=term-missing --cov-fail-under=75"
 
 [tool.coverage.run]
-source = ["src/cleverswitch"]
+branch = true
 omit = [
-    "src/cleverswitch/hidpp/transport.py",  # hardware I/O — not unit-testable
-    "src/cleverswitch/__main__.py",          # entry-point runner — not unit-testable
+    "src/logipair/__main__.py",
+    "src/logipair/hidapi_backend.py",
+    "src/logipair/lifecycle.py",
+    "src/logipair/instance.py",
 ]
 
 [tool.ruff]

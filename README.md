@@ -1,94 +1,75 @@
-# CleverSwitch
+# LogiPair
 
-A small, headless, cross-platform daemon that synchronizes host switching between Logitech keyboard and mouse.
-When you press the Easy-Switch button on the keyboard, CleverSwitch detects it and immediately sends the same host-switch command to the mouse — so both devices land on the same host simultaneously.
+LogiPair is a Windows 11-only background utility for one setup: **Logitech MX Keys + MX Anywhere 3S**.
+An Easy-Switch notification from one device is forwarded only to the other device, so the two act as a logical pair.
 
-- Runs alongside Logi Options+ or Solaar without conflicts.
-- Must be installed on every host you plan to switch from.
-- Supports connections via Logitech receivers and Bluetooth.
-- Tested with `MX Keys` and `MX Master 3` on Linux, macOS, and Windows.
+This is a focused fork/rewrite of [CleverSwitch](https://github.com/MikalaiBarysevich/CleverSwitch), licensed under GPL-3.0-or-later. It retains the useful HID++ protocol knowledge while replacing the generic pub/sub and cross-platform runtime with a small Windows actor model.
 
-> **Note:** CleverSwitch does not override device firmware. It acts as a forwarder, which means there is a small delay after reconnection. If you switch back immediately after arriving from another host, the devices may not switch together — CleverSwitch needs a moment to set everything up after reconnection.
+## Reliability contract
 
-## Support the Project
+- A `TransportActor` is the only thread allowed to open, read, write, reconnect, or close its HID handles.
+- Native hidapi operations, including enumeration, are additionally serialized process-wide.
+- `PairController` handles one switch transaction at a time and never writes `CHANGE_HOST` back to the source.
+- `READY` means critical feature discovery succeeded and all MX Keys Easy-Switch CIDs received reporting ACKs.
+- Bluetooth writes use hidapi 0.15 `hid_send_output_report` (`HidD_SetOutputReport`); receiver writes use `hid_write`.
+- `CHANGE_HOST` is fire-and-forget. LogiPair records the completed write and does not wait for a response from a device that is leaving the host.
+- Power resume, HID arrival/removal, path changes, malformed packets, transport loss, and reporting-flag removal all converge through idempotent recovery.
 
-If you find this project useful, consider supporting its development:
+The recovery backoff is `100 ms, 250 ms, 500 ms, 1 s, 2 s, 5 s, 10 s, 30 s` (capped).
 
-- **Credit Card:** [Donate via Boosty](https://boosty.to/mikalaibarysevich)
-- **Crypto:**
-    - `BTC`: 1HXzgmGZHjLMWrQC8pgYvmcm6afD4idqr7
-    - `USDT (TRC20)`: TXpJ3MHcSc144npXLuRbU81gJjD8cwAyzP
+## Supported behavior
 
-## Installation
+| Path | Status |
+|---|---|
+| MX Keys Easy-Switch → MX Anywhere 3S `CHANGE_HOST` | Implemented and simulated by automated tests |
+| MX Anywhere 3S notification → MX Keys `CHANGE_HOST` | Implemented only when a real x1814 notification is observed |
+| Bluetooth direct | Implemented; uses output reports |
+| Bolt/Unifying receiver | Implemented; short and long collections share one actor/owner |
+| Logi Options+ in parallel | Designed for non-exclusive HID access and throttled re-arm |
 
-See [installation guide](docs/Installation.md) for full installation, update, startup, and uninstall instructions for all platforms.
+The reverse mouse → keyboard path is intentionally capability-driven. LogiPair does not pretend that the physical Easy-Switch button on every MX Anywhere 3S firmware emits a usable notification. `--diagnostics` changes `reverse_notifications_observed` to `true` only after such a packet is actually seen.
 
+## Install
 
-## Hook Scripts
+Run `LogiPair-Setup-1.0.0.exe`. The per-user installer:
 
-Hook scripts let you run custom commands or scripts in response to CleverSwitch events. Hooks are executed asynchronously and never block the switch relay.
-You should use this when you need some extra logic. Like switch display input source when devices connects to current PC.
+- installs to `%LOCALAPPDATA%\Programs\LogiPair`;
+- creates the hidden per-user Scheduled Task `LogiPair` at logon;
+- configures restart-on-failure and starts the task immediately;
+- does not require elevation and does not change `PATH`;
+- removes the Scheduled Task during uninstall.
 
-By default, hooks only fire for keyboard events. Set `hooks.fire_for_all_devices: true` in config to include mouse events as well.
+Runtime data remains in `%LOCALAPPDATA%\LogiPair` so logs survive upgrades. See [Installation.md](docs/Installation.md) for verification and removal.
 
-### Events
+Do not run another Easy-Switch forwarder (CleverSwitch or OpenLogi `host_switch_targets`) at the same time. Logi Options+ may remain running.
 
-| Event        | When it fires                                                 |
-|--------------|---------------------------------------------------------------|
-| `switch`     | The Easy-Switch button was pressed and a host change was sent |
-| `connect`    | A device connected (including wake from sleep)                |
-| `disconnect` | A device disconnected (including sleep)                       |
+## Diagnostics
 
-### Environment variables
-
-Each hook receives the following environment variables:
-
-| Variable                   | Values                                | Description                                        |
-|----------------------------|---------------------------------------|----------------------------------------------------|
-| `CLEVERSWITCH_EVENT`       | `switch` \| `connect` \| `disconnect` | The event type                                     |
-| `CLEVERSWITCH_DEVICE`      | `keyboard` \| `mouse`                 | The device that triggered the event                |
-| `CLEVERSWITCH_DEVICE_NAME` | e.g. `MX Keys`                        | Human-readable device name                         |
-| `CLEVERSWITCH_TARGET_HOST` | `1`, `2`, or `3`                      | Target host number (1-based; `switch` events only) |
-
-### Configuration
-
-CleverSwitch looks for its config file at:
-
-- **Linux / macOS:** `~/.config/cleverswitch/config.yaml`
-- **Windows:** `%USERPROFILE%\.config\cleverswitch\config.yaml`
-
-You can override this path with the `--config` CLI flag.
-
-A starting point is provided in [`config.example.yaml`](config.example.yaml) — copy it to the path above and rename it to `config.yaml`.
-
-Each hook is a **named** entry with the following keys:
-
-| Key       | Description                                                                            |
-|-----------|----------------------------------------------------------------------------------------|
-| `path`    | A script to run directly, without a shell. Mutually exclusive with `command`.           |
-| `command` | A shell command (supports pipes, `$VAR` expansion, etc). Mutually exclusive with `path`. |
-| `type`    | Which event(s) fire the hook: `CONNECT`, `SWITCH`, `DISCONNECT` — a single value or a list. |
-| `timeout` | Seconds before the hook process is killed (default: `5`).                               |
-| `fire_for_all_devices` | Optional per-hook override of the global `hooks.fire_for_all_devices`. Set `true` to also fire for mouse events, or `false` to stay keyboard-only; omit to inherit the global default. |
-
-Specify exactly one of `path` or `command`; setting both (or neither) logs an error and skips that hook.
-
-```yaml
-hooks:
-  # Set to true to also fire hooks for mouse events (default: false)
-  # fire_for_all_devices: false
-
-  notifyOnSwitch:
-    command: "notify-send 'CleverSwitch' \"Switched to host $CLEVERSWITCH_TARGET_HOST\""
-    type: SWITCH
-
-  syncDisplayInput:
-    path: "~/.config/cleverswitch/on_connect.sh"
-    type: [CONNECT, DISCONNECT]
-    fire_for_all_devices: true   # this hook also fires for the mouse
-    timeout: 10
+```powershell
+& "$env:LOCALAPPDATA\Programs\LogiPair\LogiPair.exe" --status
+& "$env:LOCALAPPDATA\Programs\LogiPair\LogiPair.exe" --diagnostics
+& "$env:LOCALAPPDATA\Programs\LogiPair\LogiPair.exe" --version
 ```
 
-## Found a Bug?
+Logs rotate as five files of up to 3 MB at `%LOCALAPPDATA%\LogiPair\logs\logipair.log`.
 
-Please open a [new issue](https://github.com/MikalaiBarysevich/CleverSwitch/issues/new?template=BUG.yml).
+```powershell
+Get-Content "$env:LOCALAPPDATA\LogiPair\logs\logipair.log" -Tail 250
+Get-ChildItem "$env:LOCALAPPDATA\LogiPair\logs\logipair.log*" |
+  Sort-Object LastWriteTime |
+  Compress-Archive -DestinationPath "$env:USERPROFILE\Desktop\LogiPair-logs.zip" -Force
+```
+
+Each switch line includes source, zero-based target, peer, event-to-enqueue latency, event-to-write latency, and write result.
+
+## Build and test
+
+Requirements: Windows 11, Python 3.10+, PowerShell, and Inno Setup 6.
+
+```powershell
+& .\scripts\windows\build.ps1
+```
+
+The script creates an isolated venv, installs pinned build tools, downloads the official hidapi 0.15.0 Windows archive, verifies SHA-256 `D18C43EC9506A2F6D7FAA9C7E0A342C4B64FBAE521B71B5D4AC0777FD24DDA93`, runs lint/tests, builds the one-file EXE, smoke-tests it, and compiles the Inno installer. Outputs are written to `dist\` with `build-manifest.json` hashes.
+
+The automated suite covers source exclusion, reverse routing, duplicate suppression, single-owner I/O, disconnect during switch, failed peer writes and recovery, READY-after-ACK, external flag removal, invalid cache recovery, malformed packets, receiver ownership, and 2,000 serialized switch transactions.
