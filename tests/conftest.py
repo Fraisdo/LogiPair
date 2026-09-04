@@ -40,6 +40,12 @@ class FakeBackend:
         self.fail_change_for: set[bytes] = set()
         self.withhold_arm_ack: set[bytes] = set()
         self.withhold_responses_for: set[tuple[bytes, int, int]] = set()
+        # path -> number of reads that must fail first, reproducing a Windows arrival
+        # that exposes the HID path before the collection is usable.
+        self.stale_reads: dict[bytes, int] = {}
+        # path -> number of writes that must fail first, reproducing the
+        # HidD_SetOutputReport failures seen right after a provisional arrival.
+        self.stale_writes: dict[bytes, int] = {}
         self.slow_read_seconds: dict[bytes, float] = {}
         self._slow_read_armed: set[bytes] = set()
         self.slow_read_started = threading.Event()
@@ -68,6 +74,10 @@ class FakeBackend:
 
     def read(self, handle: FakeHandle, timeout_ms: int = 0) -> bytes | None:
         self._check(handle, "read")
+        remaining = self.stale_reads.get(handle.path, 0)
+        if remaining:
+            self.stale_reads[handle.path] = remaining - 1
+            raise TransportError("hid_read_timeout failed: ERROR_DEVICE_NOT_CONNECTED (0x48F)")
         delay = self.slow_read_seconds.pop(handle.path, 0) if handle.path in self._slow_read_armed else 0
         if delay:
             self._slow_read_armed.discard(handle.path)
@@ -87,6 +97,10 @@ class FakeBackend:
 
     def write(self, handle: FakeHandle, message: bytes, *, output_report: bool) -> None:
         self._check(handle, "write")
+        remaining = self.stale_writes.get(handle.path, 0)
+        if remaining:
+            self.stale_writes[handle.path] = remaining - 1
+            raise TransportError("hid_send_output_report failed: HidD_SetOutputReport")
         with self._lock:
             self.writes.append((handle.path, bytes(message), output_report, threading.get_ident()))
         if message[0] != REPORT_LONG:

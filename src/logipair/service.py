@@ -7,7 +7,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from .actor import TransportActor
-from .constants import LIFECYCLE_COALESCE_MAX_SECONDS, LIFECYCLE_COALESCE_SECONDS
+from .constants import LIFECYCLE_COALESCE_MAX_SECONDS, LIFECYCLE_COALESCE_SECONDS, V1_IGNORED_PIDS
 from .controller import PairController
 from .hidapi_backend import HidApiBackend
 from .lifecycle import WindowsLifecycleWatcher
@@ -168,6 +168,10 @@ class LogiPairService:
     def _group_paths(paths: list[HidPathInfo]) -> dict[str, list[HidPathInfo]]:
         groups: dict[str, list[HidPathInfo]] = defaultdict(list)
         for path in paths:
+            if path.pid in V1_IGNORED_PIDS:
+                # Out of scope for V1, which targets one Bluetooth-direct pair. Creating
+                # an actor for it only produces noise around the switches that matter.
+                continue
             if path.transport == "receiver":
                 key = f"receiver:{path.pid:04x}"
             else:

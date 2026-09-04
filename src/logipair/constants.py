@@ -59,13 +59,35 @@ ENUMERATE_RECEIVER_DEVICES = bytes([0x10, 0xFF, 0x80, 0x02, 0x02, 0x00, 0x00])
 
 BACKOFF_SECONDS = (0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0)
 
-# A device that announced an Easy-Switch move, and the peer we just wrote CHANGE_HOST to,
-# both leave this host on purpose. Their disappearance inside this window is expected and
-# must not feed the failure backoff, invalidate the cache or emit recovery warnings.
-EXPECTED_DEPARTURE_SECONDS = 2.5
-EXPECTED_DEPARTURE_RETRY_SECONDS = 0.1
+# Two distinct notions, deliberately separated.
+#
+# The grace window only classifies the errors Windows produces while it tears the old
+# live handle down. It is short because it is about handle teardown, not about the user.
+DEPARTURE_GRACE_SECONDS = 2.5
+DEPARTURE_GRACE_RETRY_SECONDS = 0.1
+#
+# "Away" has no deadline at all: after an Easy-Switch the pair sits on another host for
+# as long as the user wants - seconds, or hours. While the device is away AND absent from
+# enumeration there is nothing to open, so the actor must stay quiet instead of climbing
+# a retry ladder against a device that is simply elsewhere.
+
+# Windows can expose a Bluetooth HID path before the collection is usable: the open
+# succeeds and the first real operation fails with ERROR_DEVICE_NOT_CONNECTED (0x48F).
+# Failures this soon after an arrival are evidence of an unsettled enumeration, so they
+# get a fast bounded retry instead of the exponential ladder.
+PROVISIONAL_ARRIVAL_SECONDS = 1.0
+PROVISIONAL_RETRY_SECONDS = 0.05
+# Non-blocking reads used to prove a freshly opened REPORT_LONG path is really alive.
+PROVISIONAL_VALIDATION_READS = 3
+# While the pair is away but enumeration has not caught up yet, poll presence at a
+# calm fixed rate instead of climbing the ladder against a device that is elsewhere.
+AWAY_PRESENCE_POLL_SECONDS = 1.0
 
 # Windows raises several WM_DEVICECHANGE messages per physical device because each HID
 # interface appears/disappears separately. One burst must yield one reconciliation.
 LIFECYCLE_COALESCE_SECONDS = 0.15
 LIFECYCLE_COALESCE_MAX_SECONDS = 0.5
+
+# V1 targets exactly one pair on direct Bluetooth: MX Keys + MX Anywhere 3S. The
+# LIGHTSPEED dongle on this machine holds neither, and any actor for it is pure noise.
+V1_IGNORED_PIDS = frozenset({0xC547})

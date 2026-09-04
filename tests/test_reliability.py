@@ -7,10 +7,12 @@ import json
 import logging
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 from conftest import wait_until
 
+from logipair import actor as actor_module
 from logipair.actor import TransportActor
 from logipair.constants import (
     BACKOFF_SECONDS,
@@ -20,6 +22,7 @@ from logipair.constants import (
     KEY_FLAG_ANALYTICS,
     RECEIVER_PIDS,
     REPORT_LONG,
+    V1_IGNORED_PIDS,
 )
 from logipair.controller import PairController
 from logipair.errors import TransportError
@@ -112,7 +115,7 @@ def test_expected_departure_marks_expected_disconnected_state(fake_backend, tmp_
     device = controller.devices()[0]
 
     fake_backend.inject(b"kb", notification(2, b"\x00\x01"))
-    wait_until(lambda: device.expected_departure_until > 0)
+    wait_until(lambda: device.departure_grace_until > 0)
     # Remove the device for good so it cannot immediately reconnect.
     fake_backend.specs.pop(b"kb")
     actor.update_paths([], "device-removal")
@@ -129,7 +132,7 @@ def test_departing_source_does_not_rearm_or_rediscover(fake_backend, tmp_path):
     controller, keyboard, mouse, _, _ = start_pair(fake_backend, tmp_path)
     keyboard_device = next(item for item in controller.devices() if item.role == DeviceRole.KEYBOARD)
     fake_backend.inject(b"kb", notification(2, b"\x00\x02"))
-    wait_until(lambda: keyboard_device.expected_departure_until > 0)
+    wait_until(lambda: keyboard_device.departure_grace_until > 0)
     baseline_arms = len(fake_backend.arm_writes(b"kb"))
     baseline_writes = len([item for item in fake_backend.writes if item[0] == b"kb"])
 
@@ -145,10 +148,10 @@ def test_returning_device_clears_expected_departure(fake_backend, tmp_path):
     controller, keyboard, mouse, kb_path, _ = start_pair(fake_backend, tmp_path)
     keyboard_device = next(item for item in controller.devices() if item.role == DeviceRole.KEYBOARD)
     fake_backend.inject(b"kb", notification(2, b"\x00\x02"))
-    wait_until(lambda: keyboard_device.expected_departure_until > 0)
+    wait_until(lambda: keyboard_device.departure_grace_until > 0)
 
     keyboard.device_arrived("device-arrival")
-    wait_until(lambda: keyboard_device.expected_departure_until == 0)
+    wait_until(lambda: keyboard_device.departure_grace_until == 0)
     wait_until(lambda: keyboard_device.state == DeviceState.READY)
     stop_pair(controller, keyboard, mouse)
 
@@ -336,7 +339,12 @@ def test_pid_c547_is_classified_as_a_receiver(fake_backend, tmp_path):
     info = HidPathInfo(b"c547-long", 0x046D, 0xC547, 0xFF00, 2, 1, None, "USB Receiver")
     assert 0xC547 in RECEIVER_PIDS
     assert info.transport == "receiver"
-    assert set(LogiPairService._group_paths([info])) == {"receiver:c547"}
+    # Classified correctly, but out of scope for a V1 that targets one Bluetooth pair:
+    # no group means no actor, hence no noise around the switches that matter.
+    assert 0xC547 in V1_IGNORED_PIDS
+    assert LogiPairService._group_paths([info]) == {}
+    keyboard = HidPathInfo(b"kb", 0x046D, 0xB35B, 0xFF43, 0x0202, 2, "one")
+    assert set(LogiPairService._group_paths([info, keyboard])) == {"bluetooth:b35b:one"}
 
     actor = TransportActor(
         0xC547, [info], fake_backend, PairController(lambda *_: None), DeviceCache(tmp_path / "c.json")
@@ -350,7 +358,13 @@ def test_pid_c547_is_classified_as_a_receiver(fake_backend, tmp_path):
 def test_lightspeed_receiver_without_target_devices_goes_passive(fake_backend, tmp_path, caplog):
     info = HidPathInfo(b"c547-long", 0x046D, 0xC547, 0xFF00, 2, 1, None, "USB Receiver")
     actor = TransportActor(
-        0xC547, [info], fake_backend, PairController(lambda *_: None), DeviceCache(tmp_path / "c.json")
+        0xC547,
+        [info],
+        fake_backend,
+        PairController(lambda *_: None),
+        DeviceCache(tmp_path / "c.json"),
+        # Past the provisional grace a fresh actor gets: these are real failures.
+        provisional_arrival_seconds=0.0,
     )
     with caplog.at_level(logging.INFO, logger="logipair.actor"):
         for _ in range(len(BACKOFF_SECONDS)):
@@ -607,6 +621,8 @@ def test_discovery_is_abandoned_when_the_source_announces_a_departure(fake_backe
         "keyboard",
         "MX Keys Wireless Keyboard",
         {FEATURE_CHANGE_HOST: 2, FEATURE_REPROG_CONTROLS_V4: 3},
+        cids=(0xD1, 0xD2, 0xD3),
+        flags=KEY_FLAG_ANALYTICS,
     )
     controller = PairController(lambda *_: None, debounce_seconds=0)
     actor = TransportActor(
@@ -680,7 +696,7 @@ def test_a_device_that_does_not_actually_leave_resumes_discovery(fake_backend, t
         DeviceCache(tmp_path / "cache.json"),
         read_timeout_ms=1,
         request_timeout_ms=80,
-        expected_departure_seconds=0.3,
+        departure_grace_seconds=0.3,
     )
     controller.start()
     actor.start()
@@ -688,10 +704,406 @@ def test_a_device_that_does_not_actually_leave_resumes_discovery(fake_backend, t
     device = controller.devices()[0]
 
     fake_backend.inject(b"kb", notification(2, b"\x00\x01"))
-    wait_until(lambda: device.expected_departure_until > 0)
+    wait_until(lambda: device.departure_grace_until > 0)
     actor.ensure_ready("post-notification check")
     # The device never went away, so once the window lapses it must reach READY again.
     wait_until(lambda: device.state == DeviceState.READY, timeout=3)
 
     assert actor._retry_index == 0
     stop_pair(controller, actor)
+
+
+# --------------------------------------------------------------------------
+# RC2 root cause 1/2 - provisional Windows arrivals
+# --------------------------------------------------------------------------
+
+
+def _cached_pair(fake_backend, tmp_path, *, debounce=0.0):
+    """Mouse READY, keyboard not started yet but fully cached."""
+    kb_path = fake_backend.add(b"kb", name="MX Keys Wireless Keyboard", device_type=0)
+    mouse_path = fake_backend.add(b"mouse", name="MX Anywhere 3S", device_type=3)
+    kb_identity = f"bluetooth:{kb_path.pid:04x}:kb"
+    cache_path = tmp_path / "cache.json"
+    _write_cache(
+        cache_path,
+        kb_identity,
+        kb_path.pid,
+        "keyboard",
+        "MX Keys Wireless Keyboard",
+        {FEATURE_CHANGE_HOST: 2, FEATURE_REPROG_CONTROLS_V4: 3},
+        cids=(0xD1, 0xD2, 0xD3),
+        flags=KEY_FLAG_ANALYTICS,
+    )
+    controller = PairController(lambda *_: None, debounce_seconds=debounce)
+    cache = DeviceCache(cache_path)
+    mouse = TransportActor(
+        mouse_path.pid, [mouse_path], fake_backend, controller, cache, read_timeout_ms=1, request_timeout_ms=80
+    )
+    keyboard = TransportActor(
+        kb_path.pid, [kb_path], fake_backend, controller, cache, read_timeout_ms=1, request_timeout_ms=200
+    )
+    controller.start()
+    mouse.start()
+    wait_until(lambda: any(item.role == DeviceRole.MOUSE and item.switch_capable for item in controller.devices()))
+    return controller, keyboard, mouse, kb_identity
+
+
+def test_stale_windows_arrival_never_claims_observer_capable_then_recovers(fake_backend, tmp_path, caplog):
+    """The exact RC2 miss: Windows exposes the path early, the handle is unusable.
+
+    Host A READY -> switch to B -> devices leave -> Windows re-exposes the keyboard
+    path prematurely -> the cached handle opens -> the user immediately presses B->A.
+    Before the fix the actor claimed observer_capable here and the press was lost.
+    """
+    controller, keyboard, mouse, kb_identity = _cached_pair(fake_backend, tmp_path)
+    # Every read fails with ERROR_DEVICE_NOT_CONNECTED, exactly as the hardware did.
+    fake_backend.stale_reads[b"kb"] = 8
+    runtime = next(iter(keyboard._devices.values()))
+
+    with caplog.at_level(logging.DEBUG, logger="logipair.actor"):
+        try:
+            keyboard.start()
+            wait_until(lambda: len([item for item in fake_backend.opens if item[0] == b"kb"]) >= 3)
+
+            # The handle opened three times and was never usable: claiming otherwise is
+            # exactly the false positive that lost the user's press.
+            assert not runtime.observer_capable
+            assert not runtime.switch_capable
+            assert keyboard._retry_index == 0  # provisional, never the backoff ladder
+            assert not [
+                record
+                for record in caplog.records
+                if record.levelno >= logging.WARNING and record.name == "logipair.actor"
+            ]
+            assert any("Provisional connection not usable yet" in item for item in messages(caplog))
+
+            # Windows settles; the very next probe succeeds.
+            fake_backend.stale_reads.pop(b"kb", None)
+            wait_until(lambda: runtime.observer_capable, timeout=3)
+
+            # An Easy-Switch pressed right now must be seen and must move the mouse.
+            fake_backend.inject(b"kb", notification(2, b"\x00\x02"))
+            wait_until(lambda: len(fake_backend.change_writes(b"mouse")) == 1, timeout=3)
+        finally:
+            stop_pair(controller, keyboard, mouse)
+
+    assert fake_backend.change_writes(b"mouse")[0][1][4] == 2
+    assert any("connected_to_observer_capable_ms=" in item for item in messages(caplog))
+    assert fake_backend.violations == []
+
+
+def test_observer_capable_requires_a_validated_handle_not_just_an_open(fake_backend, tmp_path):
+    controller, keyboard, mouse, _ = _cached_pair(fake_backend, tmp_path)
+    fake_backend.stale_reads[b"kb"] = 4
+    runtime = next(iter(keyboard._devices.values()))
+    try:
+        keyboard.start()
+        # Opens succeed throughout; only validation stands between us and a false claim.
+        wait_until(lambda: len([item for item in fake_backend.opens if item[0] == b"kb"]) >= 2)
+        assert not runtime.observer_capable
+        wait_until(lambda: runtime.observer_capable, timeout=3)
+        assert not fake_backend.stale_reads.get(b"kb")
+    finally:
+        stop_pair(controller, keyboard, mouse)
+
+
+def test_provisional_failures_use_a_fast_retry_not_the_backoff_ladder(fake_backend, tmp_path):
+    path = fake_backend.add(b"kb", name="MX Keys", device_type=0)
+    controller = PairController(lambda *_: None)
+    actor = TransportActor(
+        path.pid,
+        [path],
+        fake_backend,
+        controller,
+        DeviceCache(tmp_path / "cache.json"),
+        read_timeout_ms=1,
+        request_timeout_ms=80,
+    )
+    fake_backend.stale_reads[b"kb"] = 5
+    started = time.monotonic()
+    controller.start()
+    try:
+        actor.start()
+        wait_until(lambda: len([item for item in fake_backend.opens if item[0] == b"kb"]) >= 5, timeout=3)
+        # Five ladder rungs would already be 0.1+0.25+0.5+1+2 = 3.85 s.
+        assert time.monotonic() - started < 1.5
+        assert actor._retry_index == 0
+        wait_until(lambda: controller.devices() and controller.devices()[0].state == DeviceState.READY, timeout=3)
+    finally:
+        stop_pair(controller, actor)
+
+
+def test_a_newer_arrival_supersedes_a_pending_provisional_retry(fake_backend, tmp_path):
+    path = fake_backend.add(b"kb", name="MX Keys", device_type=0)
+    controller = PairController(lambda *_: None)
+    actor = TransportActor(
+        path.pid,
+        [path],
+        fake_backend,
+        controller,
+        DeviceCache(tmp_path / "cache.json"),
+        read_timeout_ms=1,
+        request_timeout_ms=80,
+    )
+    # A provisional retry is pending far in the future, and the ladder is dirty.
+    actor._retry_at = time.monotonic() + 30.0
+    actor._retry_index = 5
+    controller.start()
+    try:
+        actor.start()
+        actor.device_arrived("device-arrival")
+        # The second Windows arrival must reconnect now, not in 30 s.
+        wait_until(lambda: controller.devices() and controller.devices()[0].state == DeviceState.READY, timeout=3)
+        assert actor._retry_index == 0
+    finally:
+        stop_pair(controller, actor)
+
+
+# --------------------------------------------------------------------------
+# RC2 root cause 3 - "away" has no deadline
+# --------------------------------------------------------------------------
+
+
+class _FakeClock:
+    """Controllable monotonic clock, so an arbitrarily long absence stays deterministic."""
+
+    def __init__(self, start: float = 10_000.0) -> None:
+        self.value = start
+
+    def monotonic(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float, *, settle: float = 0.05) -> None:
+        self.value += seconds
+        time.sleep(settle)  # let the actor's run loop observe the new time
+
+
+def _start_single_keyboard(fake_backend, tmp_path, **kwargs):
+    path = fake_backend.add(b"kb", name="MX Keys", device_type=0)
+    controller = PairController(lambda *_: None)
+    actor = TransportActor(
+        path.pid,
+        [path],
+        fake_backend,
+        controller,
+        DeviceCache(tmp_path / "cache.json"),
+        read_timeout_ms=1,
+        request_timeout_ms=80,
+        **kwargs,
+    )
+    controller.start()
+    actor.start()
+    wait_until(lambda: controller.devices() and controller.devices()[0].state == DeviceState.READY)
+    return controller, actor, path
+
+
+def test_five_minutes_away_produces_zero_connect_attempts(fake_backend, tmp_path, monkeypatch, caplog):
+    """The pair can sit on the other PC for as long as the user likes.
+
+    RC2 hardware showed the old host climbing 0.1 -> 30 s while the devices were simply
+    still connected elsewhere. Away has no TTL, so there must be no ladder at all.
+    """
+    clock = _FakeClock()
+    monkeypatch.setattr(actor_module, "time", SimpleNamespace(monotonic=clock.monotonic))
+    controller, actor, _ = _start_single_keyboard(fake_backend, tmp_path)
+    runtime = controller.devices()[0]
+
+    with caplog.at_level(logging.DEBUG, logger="logipair.actor"):
+        try:
+            fake_backend.inject(b"kb", notification(2, b"\x00\x01"))
+            wait_until(lambda: runtime.away_expected)
+            # Windows removes the device: it is now on the other host.
+            fake_backend.specs.pop(b"kb")
+            actor.update_paths([], "device-removal")
+            wait_until(lambda: runtime.state == DeviceState.EXPECTED_DISCONNECTED)
+            opens_before = len(fake_backend.opens)
+
+            for _ in range(30):  # five minutes, ten seconds at a time
+                clock.advance(10.0)
+
+            assert len(fake_backend.opens) == opens_before  # not one attempt
+            assert actor._retry_index == 0  # not one rung
+            assert runtime.state == DeviceState.EXPECTED_DISCONNECTED
+            assert runtime.away_expected
+            warnings = [
+                record.getMessage()
+                for record in caplog.records
+                if record.levelno >= logging.WARNING and record.name == "logipair.actor"
+            ]
+            assert warnings == []
+            assert len([item for item in messages(caplog) if "Expected away" in item]) == 1
+        finally:
+            stop_pair(controller, actor)
+
+
+def test_a_genuine_arrival_exits_expected_away_immediately(fake_backend, tmp_path, monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(actor_module, "time", SimpleNamespace(monotonic=clock.monotonic))
+    controller, actor, path = _start_single_keyboard(fake_backend, tmp_path)
+    runtime = controller.devices()[0]
+    try:
+        fake_backend.inject(b"kb", notification(2, b"\x00\x01"))
+        wait_until(lambda: runtime.away_expected)
+        fake_backend.specs.pop(b"kb")
+        actor.update_paths([], "device-removal")
+        wait_until(lambda: runtime.state == DeviceState.EXPECTED_DISCONNECTED)
+        clock.advance(600.0)  # ten minutes on the other PC
+        opens_before = len(fake_backend.opens)
+
+        # The user comes back to this PC.
+        fake_backend.add(b"kb", name="MX Keys", device_type=0)
+        actor.update_paths([path], "device-arrival")
+        actor.device_arrived("device-arrival")
+
+        wait_until(lambda: not runtime.away_expected)
+        wait_until(lambda: runtime.state == DeviceState.READY, timeout=3)
+        assert len(fake_backend.opens) > opens_before
+        assert actor._retry_index == 0
+    finally:
+        stop_pair(controller, actor)
+
+
+def test_enumeration_alone_ends_expected_away(fake_backend, tmp_path):
+    """A poll that lists the device again is proof of presence; no arrival event needed."""
+    controller, actor, path = _start_single_keyboard(fake_backend, tmp_path)
+    runtime = controller.devices()[0]
+    try:
+        fake_backend.inject(b"kb", notification(2, b"\x00\x01"))
+        wait_until(lambda: runtime.away_expected)
+        fake_backend.specs.pop(b"kb")
+        actor.update_paths([], "device-removal")
+        wait_until(lambda: runtime.state == DeviceState.EXPECTED_DISCONNECTED)
+
+        fake_backend.add(b"kb", name="MX Keys", device_type=0)
+        actor.update_paths([path], "poll")
+        wait_until(lambda: runtime.state == DeviceState.READY, timeout=3)
+        assert not runtime.away_expected
+        assert actor._retry_index == 0
+    finally:
+        stop_pair(controller, actor)
+
+
+def test_a_device_that_keeps_responding_is_not_treated_as_away(fake_backend, tmp_path):
+    """A hop to the host we are already on means no departure at all."""
+    controller, actor, _ = _start_single_keyboard(fake_backend, tmp_path, departure_grace_seconds=0.2)
+    runtime = controller.devices()[0]
+    try:
+        fake_backend.inject(b"kb", notification(2, b"\x00\x01"))
+        wait_until(lambda: runtime.away_expected)
+        time.sleep(0.3)  # outlive the grace window
+        fake_backend.inject(b"kb", notification(3, b"\x00\x00\x00\x00\x00\x00", function=3))
+        wait_until(lambda: not runtime.away_expected)
+        assert runtime.state == DeviceState.READY
+    finally:
+        stop_pair(controller, actor)
+
+
+def test_keyboard_is_never_observer_capable_before_arming_succeeds(fake_backend, tmp_path):
+    """A validated handle and a complete cache still do not make a keyboard observable.
+
+    This keyboard is seen through diverted x1B04 events, so until the CIDs are actually
+    ACKed we cannot see its next hop - and must not claim we can.
+    """
+    controller, keyboard, mouse, _ = _cached_pair(fake_backend, tmp_path)
+    fake_backend.withhold_arm_ack.add(b"kb")
+    runtime = next(iter(keyboard._devices.values()))
+    try:
+        keyboard.start()
+        # The transport itself is fine: it opens, validates, and CHANGE_HOST is writable.
+        wait_until(lambda: runtime.switch_capable)
+        time.sleep(0.3)
+        assert not runtime.observer_capable
+        assert runtime.state != DeviceState.READY
+
+        fake_backend.withhold_arm_ack.discard(b"kb")
+        wait_until(lambda: runtime.observer_capable, timeout=3)
+        wait_until(lambda: runtime.state == DeviceState.READY, timeout=3)
+    finally:
+        stop_pair(controller, keyboard, mouse)
+
+
+def test_rapid_a_to_b_to_a_across_a_real_departure_and_a_stale_return(fake_backend, tmp_path, caplog):
+    """The full RC2 scenario, end to end.
+
+    A READY -> switch to B -> both devices leave A -> Windows re-exposes the keyboard
+    path prematurely -> the user immediately presses B->A. The mouse must follow.
+    """
+    controller, keyboard, mouse, kb_path, mouse_path = start_pair(fake_backend, tmp_path, debounce=0)
+
+    with caplog.at_level(logging.DEBUG, logger="logipair.actor"):
+        try:
+            # --- A -> B -------------------------------------------------------
+            fake_backend.inject(b"kb", notification(2, b"\x00\x01"))
+            wait_until(lambda: len(fake_backend.change_writes(b"mouse")) == 1)
+            keyboard_runtime = next(item for item in controller.devices() if item.role == DeviceRole.KEYBOARD)
+            mouse_runtime = next(item for item in controller.devices() if item.role == DeviceRole.MOUSE)
+            wait_until(lambda: keyboard_runtime.away_expected and mouse_runtime.away_expected)
+
+            # --- both devices really leave this host ---------------------------
+            fake_backend.specs.pop(b"kb")
+            fake_backend.specs.pop(b"mouse")
+            keyboard.update_paths([], "device-removal")
+            mouse.update_paths([], "device-removal")
+            wait_until(lambda: keyboard_runtime.state == DeviceState.EXPECTED_DISCONNECTED)
+            wait_until(lambda: mouse_runtime.state == DeviceState.EXPECTED_DISCONNECTED)
+            opens_while_away = len(fake_backend.opens)
+            time.sleep(0.4)
+            assert len(fake_backend.opens) == opens_while_away  # quiet while elsewhere
+
+            # --- back to A, keyboard path exposed before it is usable ----------
+            fake_backend.add(b"kb", name="MX Keys Wireless Keyboard", device_type=0)
+            fake_backend.add(b"mouse", name="MX Anywhere 3S", device_type=3)
+            fake_backend.stale_reads[b"kb"] = 4
+            for actor, path in ((keyboard, kb_path), (mouse, mouse_path)):
+                actor.update_paths([path], "device-arrival")
+                actor.device_arrived("device-arrival")
+
+            # --- B -> A pressed as soon as the keyboard can really observe -----
+            wait_until(lambda: keyboard_runtime.observer_capable, timeout=5)
+            wait_until(lambda: mouse_runtime.switch_capable, timeout=5)
+            fake_backend.inject(b"kb", notification(2, b"\x00\x00"))
+            wait_until(lambda: len(fake_backend.change_writes(b"mouse")) == 2, timeout=5)
+
+            warnings = [
+                record.getMessage()
+                for record in caplog.records
+                if record.levelno >= logging.WARNING and record.name == "logipair.actor"
+            ]
+        finally:
+            stop_pair(controller, keyboard, mouse)
+
+    assert [item[1][4] for item in fake_backend.change_writes(b"mouse")] == [1, 0]
+    assert fake_backend.change_writes(b"kb") == []  # source exclusion holds
+    assert keyboard._retry_index == 0 and mouse._retry_index == 0
+    assert warnings == []
+    assert fake_backend.violations == []
+
+
+def test_writes_failing_just_after_a_provisional_connect_stay_quiet(fake_backend, tmp_path, caplog):
+    """RC2 log: CONNECTED, then EnsureReady failed ... HidD_SetOutputReport.
+
+    A read probe can pass while the collection is still settling and the first output
+    reports fail. That is Windows, not a fault, so it must not produce WARN spam or a
+    backoff ladder - the provisional window covers the whole unsettled period.
+    """
+    controller, keyboard, mouse, _ = _cached_pair(fake_backend, tmp_path)
+    fake_backend.stale_writes[b"kb"] = 4
+    runtime = next(iter(keyboard._devices.values()))
+
+    with caplog.at_level(logging.DEBUG, logger="logipair.actor"):
+        try:
+            keyboard.start()
+            wait_until(lambda: any("CONNECTED" in item for item in messages(caplog)))
+            wait_until(lambda: not fake_backend.stale_writes.get(b"kb"), timeout=3)
+            wait_until(lambda: runtime.observer_capable, timeout=3)
+            warnings = [
+                record.getMessage()
+                for record in caplog.records
+                if record.levelno >= logging.WARNING and record.name == "logipair.actor"
+            ]
+        finally:
+            stop_pair(controller, keyboard, mouse)
+
+    assert keyboard._retry_index == 0
+    assert warnings == []
+    assert any("Discovery deferred; Windows still settling" in item for item in messages(caplog))

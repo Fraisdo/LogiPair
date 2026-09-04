@@ -63,13 +63,16 @@ class DeviceRuntime:
     last_known_host: int | None = None
     reverse_notifications_observed: bool = False
     switch_capable: bool = False
-    # True once a live REPORT_LONG handle is open and everything needed to parse an
-    # incoming x1814 Easy-Switch notification is known. This is the first milestone
-    # after an arrival; full discovery and arming come later.
+    # True only once the live REPORT_LONG handle has been proven usable AND the
+    # notification mechanism this device actually uses is in place. Never set from
+    # cached metadata plus a successful open: Windows hands out stale handles.
     observer_capable: bool = False
-    # Monotonic deadline until which this device is allowed to vanish without it
-    # counting as a transport failure.
-    expected_departure_until: float = 0.0
+    # Short monotonic deadline covering Windows tearing the old handle down after an
+    # announced departure. Only used to classify errors, never to decide presence.
+    departure_grace_until: float = 0.0
+    # The device announced it is on another host. No deadline: it stays true until
+    # enumeration or a Windows arrival proves the device is back.
+    away_expected: bool = False
     last_error: str | None = None
     updated_at: float = dataclasses.field(default_factory=time.time)
     _lock: threading.RLock = dataclasses.field(default_factory=threading.RLock, repr=False, compare=False)
@@ -98,6 +101,7 @@ class DeviceRuntime:
                 "reverse_notifications_observed": self.reverse_notifications_observed,
                 "switch_capable": self.switch_capable,
                 "observer_capable": self.observer_capable,
+                "away_expected": self.away_expected,
                 "last_error": self.last_error,
                 "updated_at": self.updated_at,
             }
