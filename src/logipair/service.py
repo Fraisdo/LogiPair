@@ -7,6 +7,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from .actor import TransportActor
+from .constants import LIFECYCLE_COALESCE_MAX_SECONDS, LIFECYCLE_COALESCE_SECONDS
 from .controller import PairController
 from .hidapi_backend import HidApiBackend
 from .lifecycle import WindowsLifecycleWatcher
@@ -14,6 +15,60 @@ from .model import HidPathInfo, PairHealth
 from .storage import DeviceCache, StatusStore
 
 log = logging.getLogger(__name__)
+
+
+class LifecycleCoalescer:
+    """Collapses a WM_DEVICECHANGE burst into a single reconciliation.
+
+    One physical device produces several HID interface arrivals/removals, so Windows
+    fires several messages within a few milliseconds. Reconciling once per message
+    turns one Easy-Switch hop into a handful of redundant recovery cycles.
+    """
+
+    def __init__(
+        self,
+        *,
+        window_seconds: float = LIFECYCLE_COALESCE_SECONDS,
+        max_delay_seconds: float = LIFECYCLE_COALESCE_MAX_SECONDS,
+        clock=time.monotonic,
+    ) -> None:
+        self._window = window_seconds
+        self._max_delay = max_delay_seconds
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._counts: dict[str, int] = {}
+        self._first_at = 0.0
+        self._deadline = 0.0
+        self._arrival = False
+
+    def record(self, reason: str) -> None:
+        now = self._clock()
+        with self._lock:
+            if not self._counts:
+                self._first_at = now
+            self._counts[reason] = self._counts.get(reason, 0) + 1
+            self._arrival = self._arrival or reason == "device-arrival"
+            # A continuous storm must not postpone reconciliation forever.
+            self._deadline = min(now + self._window, self._first_at + self._max_delay)
+
+    def due_in(self) -> float | None:
+        """Seconds until the pending batch is due, or None when nothing is pending."""
+        with self._lock:
+            if not self._counts:
+                return None
+            return max(0.0, self._deadline - self._clock())
+
+    def take(self) -> tuple[str, bool] | None:
+        """Return (reason, saw_arrival) once the batch settled, else None."""
+        with self._lock:
+            if not self._counts or self._clock() < self._deadline:
+                return None
+            reason = ",".join(f"{name} x{count}" for name, count in sorted(self._counts.items()))
+            arrival = self._arrival
+            self._counts = {}
+            self._arrival = False
+            self._deadline = 0.0
+            return reason, arrival
 
 
 class LogiPairService:
@@ -35,6 +90,7 @@ class LogiPairService:
         self._paths: dict[str, list[HidPathInfo]] = {}
         self._controller = PairController(self._write_status)
         self._lifecycle = WindowsLifecycleWatcher(self._on_lifecycle)
+        self._lifecycle_events = LifecycleCoalescer()
         self._backend_shutdown = False
 
     def run(self) -> None:
@@ -43,10 +99,20 @@ class LogiPairService:
         self._write_status(PairHealth.DEGRADED, [])
         log.info("LogiPair service started")
         try:
+            self._reconcile("startup")
+            next_poll = time.monotonic() + self._poll_seconds
             while not self._shutdown.is_set():
-                self._reconcile("startup-or-poll")
-                self._wake.wait(self._poll_seconds)
+                self._wake.wait(self._wait_seconds(next_poll))
                 self._wake.clear()
+                if self._shutdown.is_set():
+                    break
+                batch = self._lifecycle_events.take()
+                if batch is not None:
+                    self._reconcile(batch[0], arrival=batch[1])
+                    continue
+                if time.monotonic() >= next_poll:
+                    next_poll = time.monotonic() + self._poll_seconds
+                    self._reconcile("poll")
         finally:
             self._lifecycle.stop()
             self._lifecycle.join(timeout=3.0)
@@ -56,14 +122,23 @@ class LogiPairService:
         self._shutdown.set()
         self._wake.set()
 
+    def _wait_seconds(self, next_poll: float) -> float:
+        remaining = max(0.0, next_poll - time.monotonic())
+        due = self._lifecycle_events.due_in()
+        return remaining if due is None else min(due, remaining)
+
     def _on_lifecycle(self, reason: str) -> None:
-        log.info("Windows lifecycle event: %s", reason)
         if reason.startswith("resume"):
+            log.info("Windows lifecycle event: %s", reason)
             for actor in list(self._actors.values()):
                 actor.recover(reason)
+            self._wake.set()
+            return
+        log.debug("Windows lifecycle event: %s", reason)
+        self._lifecycle_events.record(reason)
         self._wake.set()
 
-    def _reconcile(self, reason: str) -> None:
+    def _reconcile(self, reason: str, *, arrival: bool = False) -> None:
         try:
             groups = self._group_paths(self._backend.enumerate())
         except Exception as error:
@@ -79,9 +154,15 @@ class LogiPairService:
                 self._paths[key] = paths
                 actor.start()
                 continue
-            if actor is not None and self._path_set(paths) != self._path_set(self._paths.get(key, [])):
+            if actor is None:
+                continue
+            if self._path_set(paths) != self._path_set(self._paths.get(key, [])):
                 self._paths[key] = paths
                 actor.update_paths(paths, reason)
+            if arrival and paths:
+                # Enumeration confirms this transport is really back: no failure history
+                # from its absence may delay the reconnect.
+                actor.device_arrived(reason)
 
     @staticmethod
     def _group_paths(paths: list[HidPathInfo]) -> dict[str, list[HidPathInfo]]:

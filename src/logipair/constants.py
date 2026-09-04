@@ -7,8 +7,11 @@ CACHE_SCHEMA_VERSION = 1
 
 LOGITECH_VENDOR_ID = 0x046D
 BOLT_PID = 0xC548
-UNIFYING_PIDS = frozenset({0xC52B, 0xC52F, 0xC532})
-RECEIVER_PIDS = frozenset({BOLT_PID, *UNIFYING_PIDS})
+UNIFYING_PIDS = frozenset({0xC52B, 0xC52F, 0xC532, 0xC534})
+# LIGHTSPEED/Nano dongles. They enumerate as "USB Receiver" and must never be mistaken
+# for a Bluetooth-direct device on slot 0xFF (0xC547 is the one seen on this machine).
+LIGHTSPEED_PIDS = frozenset({0xC539, 0xC53A, 0xC53D, 0xC53F, 0xC541, 0xC545, 0xC547, 0xC54D})
+RECEIVER_PIDS = frozenset({BOLT_PID, *UNIFYING_PIDS, *LIGHTSPEED_PIDS})
 
 HIDPP_USAGE_PAGES = frozenset({0xFF00, 0xFF43})
 HIDPP_USAGE_SHORT = 0x0001
@@ -55,3 +58,14 @@ ENABLE_RECEIVER_NOTIFICATIONS = bytes([0x10, 0xFF, 0x80, 0x00, 0x00, 0x09, 0x00]
 ENUMERATE_RECEIVER_DEVICES = bytes([0x10, 0xFF, 0x80, 0x02, 0x02, 0x00, 0x00])
 
 BACKOFF_SECONDS = (0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0)
+
+# A device that announced an Easy-Switch move, and the peer we just wrote CHANGE_HOST to,
+# both leave this host on purpose. Their disappearance inside this window is expected and
+# must not feed the failure backoff, invalidate the cache or emit recovery warnings.
+EXPECTED_DEPARTURE_SECONDS = 2.5
+EXPECTED_DEPARTURE_RETRY_SECONDS = 0.1
+
+# Windows raises several WM_DEVICECHANGE messages per physical device because each HID
+# interface appears/disappears separately. One burst must yield one reconciliation.
+LIFECYCLE_COALESCE_SECONDS = 0.15
+LIFECYCLE_COALESCE_MAX_SECONDS = 0.5

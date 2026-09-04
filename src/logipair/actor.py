@@ -18,9 +18,12 @@ from .constants import (
     DIRECT_DEVICE_SLOT,
     ENABLE_RECEIVER_NOTIFICATIONS,
     ENUMERATE_RECEIVER_DEVICES,
+    EXPECTED_DEPARTURE_RETRY_SECONDS,
+    EXPECTED_DEPARTURE_SECONDS,
     FEATURE_CHANGE_HOST,
     FEATURE_DEVICE_TYPE_AND_NAME,
     FEATURE_REPROG_CONTROLS_V4,
+    HIDPP_USAGE_SHORT,
     HOST_SWITCH_CIDS,
     KEY_FLAG_ANALYTICS,
     KEY_FLAG_DIVERTABLE,
@@ -78,6 +81,13 @@ class _Reconcile:
 
 
 @dataclasses.dataclass(frozen=True)
+class _Arrived:
+    """A real Windows HID arrival for this transport. Clears every failure history."""
+
+    reason: str
+
+
+@dataclasses.dataclass(frozen=True)
 class _Switch:
     identity: str
     target_host: int
@@ -104,6 +114,7 @@ class TransportActor(threading.Thread):
         read_timeout_ms: int = 15,
         request_timeout_ms: int = 600,
         rearm_throttle_seconds: float = 2.0,
+        expected_departure_seconds: float = EXPECTED_DEPARTURE_SECONDS,
     ) -> None:
         super().__init__(name=f"TransportActor-0x{pid:04X}", daemon=True)
         self.pid = pid
@@ -114,6 +125,9 @@ class TransportActor(threading.Thread):
         self._read_timeout_ms = read_timeout_ms
         self._request_timeout_ms = request_timeout_ms
         self._rearm_throttle_seconds = rearm_throttle_seconds
+        self._expected_departure_seconds = expected_departure_seconds
+        self._expected_departure_until = 0.0
+        self._selected: dict[int, HidPathInfo] = {}
         self._queue: queue.PriorityQueue[tuple[int, int, object]] = queue.PriorityQueue(maxsize=256)
         self._sequence = itertools.count()
         self._handles: dict[int, Any] = {}
@@ -126,6 +140,7 @@ class TransportActor(threading.Thread):
         self._last_rearm: dict[str, float] = {}
         self._connected_at: dict[str, float] = {}
         self._ready_logged: set[str] = set()
+        self._observer_logged: set[str] = set()
         self._receiver = pid in RECEIVER_PIDS
         self._ignored = False
         if not self._receiver:
@@ -136,6 +151,10 @@ class TransportActor(threading.Thread):
 
     def recover(self, reason: str) -> None:
         self._put(0, _Reconcile(self._paths, reason, True))
+
+    def device_arrived(self, reason: str) -> None:
+        """Windows saw this transport come back; no stale backoff may survive that."""
+        self._put(0, _Arrived(reason))
 
     def ensure_ready(self, reason: str) -> None:
         if self._ensure_queued.is_set() or self._stop_requested.is_set():
@@ -171,7 +190,7 @@ class TransportActor(threading.Thread):
                 self._poll_handles()
                 if time.monotonic() >= self._retry_at:
                     for device in list(self._devices.values()):
-                        if device.state == DeviceState.RECOVERING:
+                        if device.state in (DeviceState.RECOVERING, DeviceState.EXPECTED_DISCONNECTED):
                             self._initialize(device)
         except Exception:
             log.exception("Actor pid=0x%04X terminated unexpectedly", self.pid)
@@ -210,13 +229,10 @@ class TransportActor(threading.Thread):
             self._stop_requested.set()
             return
         if isinstance(command, _Reconcile):
-            changed = {path.path for path in command.paths} != {path.path for path in self._paths}
-            self._paths = command.paths
-            if changed or command.force:
-                self._ignored = False
-                log.info("HID paths changed pid=0x%04X reason=%s", self.pid, command.reason)
-                self._mark_transport_lost("HID path changed")
-                self._retry_at = 0.0
+            self._on_reconcile(command)
+            return
+        if isinstance(command, _Arrived):
+            self._on_arrival(command.reason)
             return
         if isinstance(command, _Ensure):
             self._ensure_queued.clear()
@@ -235,6 +251,50 @@ class TransportActor(threading.Thread):
                 if not command.future.done():
                     command.future.set_result(SwitchResult(False, str(error), time.monotonic()))
                 raise
+
+    def _on_reconcile(self, command: _Reconcile) -> None:
+        changed = {path.path for path in command.paths} != {path.path for path in self._paths}
+        self._paths = command.paths
+        if command.force:
+            self._ignored = False
+            log.info("Transport recovery requested pid=0x%04X reason=%s", self.pid, command.reason)
+            self._mark_transport_lost(command.reason, bump_backoff=False)
+            return
+        if not changed:
+            return
+        self._ignored = False
+        if REPORT_LONG not in self._handles:
+            self._retry_at = 0.0
+            log.debug("HID paths changed while disconnected pid=0x%04X reason=%s", self.pid, command.reason)
+            return
+        # Windows renames or re-creates ancillary HID interfaces constantly. Only the
+        # collections we actually hold open matter; anything else is cosmetic churn.
+        selection = self._select_paths(command.paths, self._selected)
+        required = (REPORT_LONG, REPORT_SHORT) if self._receiver else (REPORT_LONG,)
+        unchanged = all(
+            report_id in selection
+            and report_id in self._selected
+            and selection[report_id].path == self._selected[report_id].path
+            for report_id in required
+        )
+        if unchanged:
+            log.debug(
+                "HID path set changed but active HID++ collections are unchanged pid=0x%04X reason=%s",
+                self.pid,
+                command.reason,
+            )
+            return
+        log.info("Active HID++ collection changed pid=0x%04X reason=%s", self.pid, command.reason)
+        self._mark_transport_lost("active HID++ collection changed", bump_backoff=False)
+
+    def _on_arrival(self, reason: str) -> None:
+        returning = self._retry_index or self._ignored or REPORT_LONG not in self._handles
+        self._retry_index = 0
+        self._retry_at = 0.0
+        self._ignored = False
+        self._clear_expected_departure("device arrival")
+        if returning:
+            log.info("Device returned pid=0x%04X reason=%s", self.pid, reason)
 
     def _drain_priority_zero(self, limit: int = 8) -> None:
         """Run urgent commands while a synchronous discovery request is waiting."""
@@ -264,29 +324,50 @@ class TransportActor(threading.Thread):
             if isinstance(command, _Switch) and not command.future.done():
                 command.future.set_result(SwitchResult(False, detail, time.monotonic()))
 
+    def _select_paths(
+        self,
+        paths: tuple[HidPathInfo, ...],
+        previous: dict[int, HidPathInfo] | None = None,
+    ) -> dict[int, HidPathInfo]:
+        """Pick the HID++ collections to own, preferring the ones already open.
+
+        Selection is stable: Windows may re-order an enumeration without anything
+        relevant having changed, and a reshuffle must never cost us the transport.
+        """
+        selected: dict[int, HidPathInfo] = {}
+        for report_id, usages in ((REPORT_LONG, LONG_USAGES), (REPORT_SHORT, {HIDPP_USAGE_SHORT})):
+            candidates = sorted((path for path in paths if path.usage in usages), key=lambda item: item.path)
+            if not candidates:
+                continue
+            keep = previous.get(report_id) if previous else None
+            selected[report_id] = next(
+                (path for path in candidates if keep is not None and path.path == keep.path),
+                candidates[0],
+            )
+        return selected
+
     def _connect(self) -> None:
         for device in self._devices.values():
-            device.switch_capable = False
+            self._set_switch_capable(device, False)
+            self._set_observer_capable(device, False)
             self._transition(device, DeviceState.CONNECTING)
         self._close_handles()
         try:
-            selected: dict[int, HidPathInfo] = {}
-            for path in self._paths:
-                if path.usage in LONG_USAGES and REPORT_LONG not in selected:
-                    selected[REPORT_LONG] = path
-                elif path.usage == 1 and REPORT_SHORT not in selected:
-                    selected[REPORT_SHORT] = path
+            selected = self._select_paths(self._paths, self._selected)
             if REPORT_LONG not in selected:
                 raise TransportError("long HID++ collection not found")
             if self._receiver and REPORT_SHORT not in selected:
                 raise TransportError("receiver short HID++ collection not found")
             for report_id, path in selected.items():
                 self._handles[report_id] = self._backend.open(path.path)
+            self._selected = selected
             self._retry_index = 0
+            self._clear_expected_departure("transport reopened")
             connected_at = time.monotonic()
             for device in self._devices.values():
                 self._connected_at[device.identity] = connected_at
                 self._ready_logged.discard(device.identity)
+                self._observer_logged.discard(device.identity)
             log.info("CONNECTED pid=0x%04X transport=%s", self.pid, "receiver" if self._receiver else "Bluetooth")
             if self._receiver:
                 self._backend.write(self._handles[REPORT_SHORT], ENABLE_RECEIVER_NOTIFICATIONS, output_report=False)
@@ -295,12 +376,20 @@ class TransportActor(threading.Thread):
                 self._initialize(self._ensure_direct_runtime())
         except Exception as error:
             self._close_handles()
-            delay = BACKOFF_SECONDS[min(self._retry_index, len(BACKOFF_SECONDS) - 1)]
-            self._retry_index += 1
-            self._retry_at = time.monotonic() + delay
+            expected = self._expected_departure()
+            delay = self._schedule_retry(expected=expected)
+            state = DeviceState.EXPECTED_DISCONNECTED if expected else DeviceState.RECOVERING
             for device in self._devices.values():
-                self._transition(device, DeviceState.RECOVERING, str(error))
-            log.warning("Connect failed pid=0x%04X retry_in=%.2fs error=%s", self.pid, delay, error)
+                self._transition(device, state, None if expected else str(error))
+            if expected:
+                log.debug("Transport still away after expected departure pid=0x%04X detail=%s", self.pid, error)
+            elif self._receiver and not self._devices and self._retry_index >= len(BACKOFF_SECONDS):
+                # A LIGHTSPEED/Unifying dongle that never reports one of our target devices
+                # is out of scope for this pair. Stop burning cycles and log lines on it.
+                self._ignored = True
+                log.info("Receiver pid=0x%04X holds no target device; staying passive (%s)", self.pid, error)
+            else:
+                log.warning("Connect failed pid=0x%04X retry_in=%.2fs error=%s", self.pid, delay, error)
 
     def _poll_handles(self) -> None:
         for report_id in (REPORT_LONG, REPORT_SHORT):
@@ -330,8 +419,15 @@ class TransportActor(threading.Thread):
             return
         if isinstance(report, HidError):
             if report.sw_id == SW_ID_HOST_CHANGE:
+                if self._expected_departure(device):
+                    log.debug(
+                        "CHANGE_HOST error 0x%02X while %s is leaving; not a cache fault",
+                        report.error_code,
+                        device.identity,
+                    )
+                    return
                 self._cache.invalidate(device.identity, "CHANGE_HOST protocol error")
-                device.switch_capable = False
+                self._set_switch_capable(device, False)
                 self._mark_transport_lost(f"CHANGE_HOST HID++ error 0x{report.error_code:02X}")
             return
         if isinstance(report, Notification):
@@ -342,6 +438,10 @@ class TransportActor(threading.Thread):
                 if device.role == DeviceRole.MOUSE:
                     device.reverse_notifications_observed = True
                 log.info("EasySwitch source=%s target=%d", device.identity, target)
+                # The keyboard just told us it is leaving this host. Everything that
+                # follows (read failures, path removal, Windows device-removal) is
+                # expected, and no further discovery may be started on it.
+                self._mark_expected_departure(device, "source", target)
                 if device.role is not None:
                     self._controller.submit(HostChange(device.identity, device.role, target, observed_at))
             return
@@ -384,6 +484,14 @@ class TransportActor(threading.Thread):
     def _initialize(self, device: DeviceRuntime) -> None:
         if REPORT_LONG not in self._handles or self._stop_requested.is_set():
             return
+        if self._expected_departure(device):
+            log.debug("Discovery deferred; %s is leaving this host", device.identity)
+            if device.state != DeviceState.READY:
+                # Stay on the run loop's retry list so discovery resumes if the device
+                # turns out to stay (e.g. the target host was the current one).
+                self._transition(device, DeviceState.EXPECTED_DISCONNECTED)
+                self._schedule_retry(expected=True)
+            return
         cached = self._cache.get(device.identity, device.wpid)
         if cached:
             old = device.state
@@ -408,6 +516,9 @@ class TransportActor(threading.Thread):
         if cached:
             if self._cached_switch_prerequisites_valid(device):
                 self._controller.register(device, self, publish_status=False)
+                # Hot path first: with the cache we can already parse x1814 and write
+                # CHANGE_HOST. Cosmetic discovery below must not delay either.
+                self._refresh_observer_capable(device)
                 self._set_switch_capable(device, True)
             else:
                 self._cache.invalidate(device.identity, "invalid cached switch prerequisites")
@@ -452,6 +563,7 @@ class TransportActor(threading.Thread):
                 device.supported_flags = 0
                 cached = None
             device.feature_indexes[FEATURE_CHANGE_HOST] = change_host_idx
+            self._refresh_observer_capable(device)
             self._set_switch_capable(device, True)
 
             if device.role == DeviceRole.KEYBOARD:
@@ -475,11 +587,17 @@ class TransportActor(threading.Thread):
         except (ProtocolError, TransportError, ValueError) as error:
             if self._stop_requested.is_set():
                 return
-            self._transition(device, DeviceState.RECOVERING, str(error))
-            delay = BACKOFF_SECONDS[min(self._retry_index, len(BACKOFF_SECONDS) - 1)]
-            self._retry_index += 1
-            self._retry_at = time.monotonic() + delay
-            log.warning("EnsureReady failed identity=%s retry_in=%.2fs error=%s", device.identity, delay, error)
+            expected = self._expected_departure(device)
+            self._transition(
+                device,
+                DeviceState.EXPECTED_DISCONNECTED if expected else DeviceState.RECOVERING,
+                None if expected else str(error),
+            )
+            delay = self._schedule_retry(expected=expected)
+            if expected:
+                log.debug("Discovery abandoned; %s is leaving this host (%s)", device.identity, error)
+            else:
+                log.warning("EnsureReady failed identity=%s retry_in=%.2fs error=%s", device.identity, delay, error)
 
     def _resolve_feature(self, device: DeviceRuntime, feature_code: int) -> int | None:
         response = self._request_raw(device, build_get_feature(device.slot, feature_code), 0, 0, SW_ID_REQUEST)
@@ -537,6 +655,11 @@ class TransportActor(threading.Thread):
         return tuple(found), supported
 
     def _arm(self, device: DeviceRuntime) -> None:
+        if self._expected_departure(device):
+            log.debug("Re-arming skipped; %s is leaving this host", device.identity)
+            self._transition(device, DeviceState.EXPECTED_DISCONNECTED)
+            self._schedule_retry(expected=True)
+            return
         self._transition(device, DeviceState.ARMING)
         feature_index = device.feature_indexes.get(FEATURE_REPROG_CONTROLS_V4)
         if feature_index is None or not device.easy_switch_cids:
@@ -553,10 +676,13 @@ class TransportActor(threading.Thread):
         except (ProtocolError, TransportError) as error:
             if self._stop_requested.is_set():
                 return
-            self._transition(device, DeviceState.RECOVERING, str(error))
-            delay = BACKOFF_SECONDS[min(self._retry_index, len(BACKOFF_SECONDS) - 1)]
-            self._retry_index += 1
-            self._retry_at = time.monotonic() + delay
+            expected = self._expected_departure(device)
+            self._transition(
+                device,
+                DeviceState.EXPECTED_DISCONNECTED if expected else DeviceState.RECOVERING,
+                None if expected else str(error),
+            )
+            self._schedule_retry(expected=expected)
 
     def _request(
         self,
@@ -579,6 +705,7 @@ class TransportActor(threading.Thread):
         self._raise_if_stopping()
         self._drain_priority_zero()
         self._raise_if_stopping()
+        self._raise_if_departing(device)
         handle = self._handles.get(REPORT_LONG)
         if handle is None:
             raise TransportError("long transport unavailable")
@@ -587,6 +714,9 @@ class TransportActor(threading.Thread):
         while not self._stop_requested.is_set() and time.monotonic() < deadline:
             self._drain_priority_zero()
             self._raise_if_stopping()
+            # An Easy-Switch notification may have been dispatched from the read below.
+            # Stop talking to a device that just announced it is leaving this host.
+            self._raise_if_departing(device)
             if self._handles.get(REPORT_LONG) is not handle:
                 raise TransportError("transport changed during request")
             raw = self._backend.read(handle, min(self._read_timeout_ms, 25))
@@ -627,25 +757,71 @@ class TransportActor(threading.Thread):
             # CHANGE_HOST is fire-and-forget. A reply cannot be required after the peer leaves this host.
             device.transition(previous_state)
             command.future.set_result(SwitchResult(True, "write completed", wrote_at))
+            # The mouse now leaves this host too. Off the hot path, after the future.
+            self._mark_expected_departure(device, "peer", command.target_host)
         except (KeyError, TransportError, ValueError) as error:
             wrote_at = time.monotonic()
-            device.switch_capable = False
-            self._cache.invalidate(device.identity, "CHANGE_HOST write failed")
-            self._transition(device, DeviceState.RECOVERING, str(error))
+            expected = self._expected_departure(device)
+            self._set_switch_capable(device, False)
+            if not expected:
+                self._cache.invalidate(device.identity, "CHANGE_HOST write failed")
             command.future.set_result(SwitchResult(False, str(error), wrote_at))
             self._mark_transport_lost(str(error))
 
-    def _mark_transport_lost(self, reason: str) -> None:
+    def _mark_transport_lost(self, reason: str, *, bump_backoff: bool = True) -> None:
+        expected = self._expected_departure()
         self._close_handles()
+        state = DeviceState.EXPECTED_DISCONNECTED if expected else DeviceState.RECOVERING
         for device in self._devices.values():
-            device.switch_capable = False
-            self._transition(device, DeviceState.RECOVERING, reason)
+            self._set_switch_capable(device, False)
+            self._set_observer_capable(device, False)
+            self._transition(device, state, None if expected else reason)
         if self._stop_requested.is_set():
+            return
+        if expected:
+            # Nothing is broken: the device left on purpose. Poll back quickly and keep
+            # the failure history untouched so its return costs no backoff.
+            self._retry_at = time.monotonic() + EXPECTED_DEPARTURE_RETRY_SECONDS
+            log.debug("Expected disconnect pid=0x%04X detail=%s", self.pid, reason)
+            return
+        if not bump_backoff:
+            self._retry_at = 0.0
+            log.info("Transport reset pid=0x%04X reason=%s", self.pid, reason)
             return
         delay = BACKOFF_SECONDS[min(self._retry_index, len(BACKOFF_SECONDS) - 1)]
         self._retry_index += 1
         self._retry_at = time.monotonic() + delay
         log.warning("Transport lost pid=0x%04X retry_in=%.2fs error=%s", self.pid, delay, reason)
+
+    def _schedule_retry(self, *, expected: bool) -> float:
+        if expected:
+            self._retry_at = time.monotonic() + EXPECTED_DEPARTURE_RETRY_SECONDS
+            return EXPECTED_DEPARTURE_RETRY_SECONDS
+        delay = BACKOFF_SECONDS[min(self._retry_index, len(BACKOFF_SECONDS) - 1)]
+        self._retry_index += 1
+        self._retry_at = time.monotonic() + delay
+        return delay
+
+    def _mark_expected_departure(self, device: DeviceRuntime, kind: str, target_host: int) -> None:
+        deadline = time.monotonic() + self._expected_departure_seconds
+        device.expected_departure_until = deadline
+        self._expected_departure_until = max(self._expected_departure_until, deadline)
+        log.info("Expected departure %s=%s target=%d", kind, device.identity, target_host)
+
+    def _expected_departure(self, device: DeviceRuntime | None = None) -> bool:
+        deadline = device.expected_departure_until if device is not None else self._expected_departure_until
+        return time.monotonic() < deadline
+
+    def _clear_expected_departure(self, reason: str) -> None:
+        pending = self._expected_departure_until > 0.0 or any(
+            device.expected_departure_until > 0.0 for device in self._devices.values()
+        )
+        if not pending:
+            return
+        self._expected_departure_until = 0.0
+        for device in self._devices.values():
+            device.expected_departure_until = 0.0
+        log.debug("Expected departure cleared pid=0x%04X reason=%s", self.pid, reason)
 
     def _close_handles(self) -> None:
         for handle in list(self._handles.values()):
@@ -680,6 +856,25 @@ class TransportActor(threading.Thread):
         if changed:
             self._controller.capability_changed(device)
 
+    def _refresh_observer_capable(self, device: DeviceRuntime) -> None:
+        self._set_observer_capable(
+            device,
+            REPORT_LONG in self._handles
+            and device.role is not None
+            and isinstance(device.feature_indexes.get(FEATURE_CHANGE_HOST), int),
+        )
+
+    def _set_observer_capable(self, device: DeviceRuntime, capable: bool) -> None:
+        if device.observer_capable == capable:
+            return
+        device.observer_capable = capable
+        if not capable or device.identity in self._observer_logged:
+            return
+        self._observer_logged.add(device.identity)
+        started = self._connected_at.get(device.identity)
+        elapsed_ms = (time.monotonic() - started) * 1000 if started is not None else 0.0
+        log.info("connected_to_observer_capable_ms=%.2f identity=%s", elapsed_ms, device.identity)
+
     @staticmethod
     def _cached_switch_prerequisites_valid(device: DeviceRuntime) -> bool:
         feature_index = device.feature_indexes.get(FEATURE_CHANGE_HOST)
@@ -693,6 +888,10 @@ class TransportActor(threading.Thread):
     def _raise_if_stopping(self) -> None:
         if self._stop_requested.is_set():
             raise TransportError("actor stopping")
+
+    def _raise_if_departing(self, device: DeviceRuntime) -> None:
+        if self._expected_departure(device):
+            raise TransportError("device is leaving this host")
 
     def _device_for_slot(self, slot: int) -> DeviceRuntime | None:
         if not self._receiver:

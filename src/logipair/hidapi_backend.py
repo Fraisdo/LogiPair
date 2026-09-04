@@ -1,9 +1,15 @@
 """Minimal Windows hidapi 0.15 binding with strict handle ownership.
 
 Every operation touching a ``hid_device*`` verifies that it runs on the thread
-that opened it. A process-wide lock also keeps ``hid_enumerate`` away from
-open/read/write/close calls in other actors; this deliberately trades at most a
-few milliseconds of latency for native-library safety on Windows.
+that opened it, which is the same-handle protection hidapi requires: a
+``TransportActor`` is the sole owner of its handles, so no two threads can ever
+touch one ``hid_device*``.
+
+Only the calls hidapi documents as globally serialized take the process-wide
+lock: ``hid_init``, ``hid_exit``, ``hid_enumerate``, ``hid_open_path`` and
+``hid_close``. Per-device reads and writes deliberately run lock-free so that an
+MX Keys read never queues behind an MX Anywhere read, a receiver poll or an
+unrelated discovery request.
 """
 
 from __future__ import annotations
@@ -138,6 +144,15 @@ class HidApiBackend:
         lib.hid_send_output_report.restype = ctypes.c_int
         lib.hid_error.argtypes = [ctypes.c_void_p]
         lib.hid_error.restype = ctypes.c_wchar_p
+        # hidapi >= 0.14 scopes read failures separately. Without it, a failing read
+        # reports whatever the last write left behind (e.g. "HidD_SetOutputReport").
+        try:
+            lib.hid_read_error.argtypes = [ctypes.c_void_p]
+            lib.hid_read_error.restype = ctypes.c_wchar_p
+            self._read_error_fn = lib.hid_read_error
+        except AttributeError:
+            self._read_error_fn = None
+            log.warning("hidapi lacks hid_read_error; read failures may report a stale write error")
 
     def enumerate(self) -> list[HidPathInfo]:
         with self._native_lock:
@@ -181,27 +196,27 @@ class HidApiBackend:
             return OwnedHandle(int(pointer), path, owner)
 
     def read(self, handle: OwnedHandle, timeout_ms: int = 0) -> bytes | None:
+        # No global lock: the owning actor thread is the only user of this handle.
         self._assert_owner(handle)
-        with self._native_lock:
-            self._assert_running()
-            self._assert_open(handle)
-            buf = (ctypes.c_ubyte * MAX_READ_SIZE)()
-            count = self._lib.hid_read_timeout(handle.pointer, buf, MAX_READ_SIZE, timeout_ms)
-            if count < 0:
-                raise TransportError(f"hid_read_timeout failed: {self._error(handle.pointer)}")
-            return bytes(buf[:count]) if count else None
+        self._assert_running()
+        self._assert_open(handle)
+        buf = (ctypes.c_ubyte * MAX_READ_SIZE)()
+        count = self._lib.hid_read_timeout(handle.pointer, buf, MAX_READ_SIZE, timeout_ms)
+        if count < 0:
+            raise TransportError(f"hid_read_timeout failed: {self._read_error(handle.pointer)}")
+        return bytes(buf[:count]) if count else None
 
     def write(self, handle: OwnedHandle, message: bytes, *, output_report: bool) -> None:
+        # No global lock: see read().
         self._assert_owner(handle)
-        with self._native_lock:
-            self._assert_running()
-            self._assert_open(handle)
-            buf = (ctypes.c_ubyte * len(message))(*message)
-            function = self._lib.hid_send_output_report if output_report else self._lib.hid_write
-            count = function(handle.pointer, buf, len(message))
-            if count < 0:
-                operation = "hid_send_output_report" if output_report else "hid_write"
-                raise TransportError(f"{operation} failed: {self._error(handle.pointer)}")
+        self._assert_running()
+        self._assert_open(handle)
+        buf = (ctypes.c_ubyte * len(message))(*message)
+        function = self._lib.hid_send_output_report if output_report else self._lib.hid_write
+        count = function(handle.pointer, buf, len(message))
+        if count < 0:
+            operation = "hid_send_output_report" if output_report else "hid_write"
+            raise TransportError(f"{operation} failed: {self._error(handle.pointer)}")
 
     def close(self, handle: OwnedHandle) -> None:
         self._assert_owner(handle)
@@ -236,3 +251,10 @@ class HidApiBackend:
     def _error(self, pointer: int | None) -> str:
         value = self._lib.hid_error(pointer)
         return value or "unknown hidapi error"
+
+    def _read_error(self, pointer: int | None) -> str:
+        """Read failures must use hid_read_error; hid_error would return the last write error."""
+        if self._read_error_fn is None:
+            return self._error(pointer)
+        value = self._read_error_fn(pointer)
+        return value or "unknown hidapi read error"

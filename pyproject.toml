@@ -30,7 +30,6 @@ addopts = "--tb=short --cov=logipair --cov-report=term-missing --cov-fail-under=
 branch = true
 omit = [
     "src/logipair/__main__.py",
-    "src/logipair/hidapi_backend.py",
     "src/logipair/lifecycle.py",
     "src/logipair/instance.py",
 ]

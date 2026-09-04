@@ -6,6 +6,8 @@ import threading
 import time
 from typing import Any
 
+from .constants import RECEIVER_PIDS
+
 
 class DeviceRole(str, enum.Enum):
     KEYBOARD = "keyboard"
@@ -14,6 +16,7 @@ class DeviceRole(str, enum.Enum):
 
 class DeviceState(str, enum.Enum):
     DISCONNECTED = "DISCONNECTED"
+    EXPECTED_DISCONNECTED = "EXPECTED_DISCONNECTED"
     CONNECTING = "CONNECTING"
     INITIALIZING = "INITIALIZING"
     ARMING = "ARMING"
@@ -41,7 +44,7 @@ class HidPathInfo:
 
     @property
     def transport(self) -> str:
-        return "receiver" if self.pid in {0xC52B, 0xC52F, 0xC532, 0xC548} else "bluetooth"
+        return "receiver" if self.pid in RECEIVER_PIDS else "bluetooth"
 
 
 @dataclasses.dataclass
@@ -60,6 +63,13 @@ class DeviceRuntime:
     last_known_host: int | None = None
     reverse_notifications_observed: bool = False
     switch_capable: bool = False
+    # True once a live REPORT_LONG handle is open and everything needed to parse an
+    # incoming x1814 Easy-Switch notification is known. This is the first milestone
+    # after an arrival; full discovery and arming come later.
+    observer_capable: bool = False
+    # Monotonic deadline until which this device is allowed to vanish without it
+    # counting as a transport failure.
+    expected_departure_until: float = 0.0
     last_error: str | None = None
     updated_at: float = dataclasses.field(default_factory=time.time)
     _lock: threading.RLock = dataclasses.field(default_factory=threading.RLock, repr=False, compare=False)
@@ -87,6 +97,7 @@ class DeviceRuntime:
                 "supported_flags": f"0x{self.supported_flags:02X}",
                 "reverse_notifications_observed": self.reverse_notifications_observed,
                 "switch_capable": self.switch_capable,
+                "observer_capable": self.observer_capable,
                 "last_error": self.last_error,
                 "updated_at": self.updated_at,
             }

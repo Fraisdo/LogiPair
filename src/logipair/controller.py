@@ -113,6 +113,8 @@ class PairController(threading.Thread):
                     DeviceState.ARMING,
                     DeviceState.RECOVERING,
                     DeviceState.SWITCHING,
+                    # An expected Easy-Switch departure is transient, not a degradation.
+                    DeviceState.EXPECTED_DISCONNECTED,
                 }
                 for item in selected
             ):
