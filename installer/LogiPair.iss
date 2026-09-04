@@ -19,8 +19,10 @@ OutputBaseFilename=LogiPair-Setup-{#MyAppVersion}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\assets\logipair.ico
 CloseApplications=yes
 RestartApplications=no
+; The executable carries the icon as a resource, so Add/Remove Programs picks it up.
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
 [Files]
@@ -29,10 +31,12 @@ Source: "..\scripts\windows\install-task.ps1"; DestDir: "{app}"; Flags: ignoreve
 Source: "..\scripts\windows\remove-task.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+; Shipped alongside the executable so a future tray icon can reuse the same asset.
+Source: "..\assets\logipair.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\LogiPair Status"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--status"
-Name: "{group}\LogiPair Diagnostics"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--diagnostics"
+Name: "{group}\LogiPair Status"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--status"; IconFilename: "{app}\logipair.ico"
+Name: "{group}\LogiPair Diagnostics"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--diagnostics"; IconFilename: "{app}\logipair.ico"
 
 [Run]
 Filename: "powershell.exe"; Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\install-task.ps1"" -ExePath ""{app}\{#MyAppExeName}"""; Flags: runhidden waituntilterminated

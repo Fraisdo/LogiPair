@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <title>LogiPair</title>
+  <line x1="72" y1="72" x2="184" y2="184" stroke="#2E9AD4" stroke-width="36" stroke-linecap="round"/>
+  <rect x="26" y="26" width="92" height="92" rx="28" fill="#3B6FF5"/>
+  <rect x="138" y="138" width="92" height="92" rx="28" fill="#16C3A6"/>
+</svg>

@@ -38,13 +38,17 @@ if ($LASTEXITCODE -ne 0) { throw 'LogiPair installation failed' }
 Push-Location $projectRoot
 try {
     if (-not $SkipTests) {
-        & $pythonExe -m ruff check src\logipair tests
+        & $pythonExe -m ruff check src\logipair tests scripts\generate_icon.py scripts\verify_icon.py
         if ($LASTEXITCODE -ne 0) { throw 'ruff failed' }
         & $pythonExe -m pytest
         if ($LASTEXITCODE -ne 0) { throw 'pytest failed' }
     }
-    & $pythonExe -m PyInstaller --noconfirm --clean --onefile --name LogiPair --paths src --add-binary "$dllPath;." src\logipair\__main__.py
+    $iconPath = Join-Path $projectRoot 'assets\logipair.ico'
+    if (-not (Test-Path -LiteralPath $iconPath)) { throw "application icon not found: $iconPath" }
+    & $pythonExe -m PyInstaller --noconfirm --clean --onefile --name LogiPair --paths src --icon $iconPath --add-binary "$dllPath;." src\logipair\__main__.py
     if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed' }
+    & $pythonExe (Join-Path $projectRoot 'scripts\verify_icon.py') (Join-Path $projectRoot 'dist\LogiPair.exe')
+    if ($LASTEXITCODE -ne 0) { throw 'icon resource verification failed' }
     & (Join-Path $projectRoot 'dist\LogiPair.exe') --version
     if ($LASTEXITCODE -ne 0) { throw 'binary smoke test failed' }
 
